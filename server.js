@@ -109,6 +109,11 @@ const fetchHereTrafficData = async () => {
     return { trafficData: syntheticData, segmentMetadata: {} };
   }
   
+  // Temporarily use synthetic data while debugging HERE API integration
+  console.log('🚧 Using synthetic data temporarily while fixing HERE API integration');
+  const syntheticData = generateSyntheticTrafficData();
+  return { trafficData: syntheticData, segmentMetadata: {} };
+  
   try {
     console.log('Fetching traffic data from HERE API (single bounding box)...');
     
