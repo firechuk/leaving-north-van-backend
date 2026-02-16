@@ -149,8 +149,16 @@ const fetchHereTrafficData = async () => {
       const coordinates = segment.location?.shape || [];
       const segmentId = `here-live-${index}`;
       
-      // Convert HERE coordinates to GeoJSON format
-      const geojsonCoords = coordinates.map(coord => [coord.lng || coord[1], coord.lat || coord[0]]);
+      // Convert HERE coordinates to GeoJSON format safely
+      let geojsonCoords = [];
+      if (coordinates && Array.isArray(coordinates)) {
+        geojsonCoords = coordinates.map(coord => {
+          if (coord && typeof coord === 'object') {
+            return [coord.lng || coord.lon || coord[1] || 0, coord.lat || coord[0] || 0];
+          }
+          return [0, 0]; // fallback
+        });
+      }
       
       trafficData.push({
         segmentId: segmentId,
