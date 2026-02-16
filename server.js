@@ -105,7 +105,8 @@ const initializeSegments = () => {
 const fetchHereTrafficData = async () => {
   if (!HERE_API_KEY || HERE_API_KEY === 'YOUR_HERE_API_KEY_NEEDED') {
     console.log('⚠️ HERE API key not configured, using synthetic data');
-    return generateSyntheticTrafficData();
+    const syntheticData = generateSyntheticTrafficData();
+    return { trafficData: syntheticData, segmentMetadata: {} };
   }
   
   try {
@@ -133,6 +134,7 @@ const fetchHereTrafficData = async () => {
     
     // Convert HERE traffic segments to our format
     const trafficData = [];
+    const segmentMetadata = {};
     
     response.data.results.forEach((segment, index) => {
       // Extract traffic flow data
@@ -147,23 +149,38 @@ const fetchHereTrafficData = async () => {
       const coordinates = segment.location?.shape || [];
       const segmentId = `here-live-${index}`;
       
+      // Convert HERE coordinates to GeoJSON format
+      const geojsonCoords = coordinates.map(coord => [coord.lng || coord[1], coord.lat || coord[0]]);
+      
       trafficData.push({
         segmentId: segmentId,
         ratio: Math.max(0.1, flowRatio),
-        coordinates: coordinates, // Real road geometry from HERE
         speed: currentSpeed,
         freeFlowSpeed: freeFlowSpeed,
         jamFactor: currentFlow.jamFactor || 0,
         confidence: currentFlow.confidence || 1.0
       });
+      
+      // Store segment metadata for frontend
+      segmentMetadata[segmentId] = {
+        name: `Traffic Segment ${index + 1}`,
+        coordinates: geojsonCoords,
+        type: 'road', // HERE doesn't categorize, so use generic
+        originalData: {
+          shape: coordinates,
+          currentFlow: currentFlow,
+          freeFlow: freeFlow
+        }
+      };
     });
     
     console.log(`✅ Processed ${trafficData.length} live traffic segments`);
-    return trafficData;
+    return { trafficData, segmentMetadata };
     
   } catch (error) {
     console.log('❌ HERE API failed, falling back to synthetic data:', error.response?.status, error.message);
-    return generateSyntheticTrafficData();
+    const syntheticData = generateSyntheticTrafficData();
+    return { trafficData: syntheticData, segmentMetadata: {} };
   }
 };
 
@@ -244,7 +261,13 @@ const collectTrafficData = async () => {
     const timestamp = new Date().toISOString();
     console.log(`🚗 Collecting traffic data at ${timestamp}`);
     
-    const trafficData = await fetchHereTrafficData();
+    const { trafficData, segmentMetadata } = await fetchHereTrafficData();
+    
+    // Update segment data with new HERE metadata
+    if (segmentMetadata && Object.keys(segmentMetadata).length > 0) {
+      Object.assign(segmentData, segmentMetadata);
+      console.log(`📍 Updated segment metadata for ${Object.keys(segmentMetadata).length} segments`);
+    }
     
     // Convert to interval format
     const interval = {
