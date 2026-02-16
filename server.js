@@ -147,7 +147,7 @@ const fetchHereTrafficData = async () => {
       
       // Create segment data with real coordinates from HERE
       const coordinates = segment.location?.shape || [];
-      const segmentId = `here-live-${index}`;
+      const segmentId = `here-0-${index}`;
       
       // Convert HERE coordinates to GeoJSON format safely
       let geojsonCoords = [];
