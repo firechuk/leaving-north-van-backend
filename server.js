@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -100,7 +101,7 @@ const initializeSegments = () => {
   console.log(`✅ Initialized ${Object.keys(segmentData).length} segments across ${NORTH_VAN_ROADS.length} roads`);
 };
 
-// Fetch traffic data from HERE API
+// Fetch traffic data from HERE API using efficient bounding box approach
 const fetchHereTrafficData = async () => {
   if (!HERE_API_KEY || HERE_API_KEY === 'YOUR_HERE_API_KEY_NEEDED') {
     console.log('⚠️ HERE API key not configured, using synthetic data');
@@ -108,66 +109,60 @@ const fetchHereTrafficData = async () => {
   }
   
   try {
-    console.log('Fetching traffic data from HERE API...');
-    const trafficData = [];
+    console.log('Fetching traffic data from HERE API (single bounding box)...');
     
-    // Query traffic for each road
-    for (const [index, road] of NORTH_VAN_ROADS.entries()) {
-      try {
-        const response = await axios.get(HERE_BASE_URL, {
-          params: {
-            bbox: road.bbox,
-            apikey: HERE_API_KEY
-          },
-          timeout: 5000
-        });
-        
-        // Process HERE API response and map to our segments
-        const segmentCount = road.priority === 'high' ? 8 : road.priority === 'medium' ? 4 : 2;
-        
-        for (let i = 0; i < segmentCount; i++) {
-          const segmentId = `here-${index}-${i}`;
-          
-          // Extract traffic flow ratio from HERE response
-          let flowRatio = 1.0; // Default free flow
-          
-          if (response.data && response.data.results) {
-            // HERE API returns different structure, adapt as needed
-            const avgSpeed = response.data.results[0]?.currentFlow?.speed || 50;
-            const freeFlowSpeed = response.data.results[0]?.freeFlow?.speed || 50;
-            flowRatio = freeFlowSpeed > 0 ? Math.min(1.0, avgSpeed / freeFlowSpeed) : 1.0;
-          }
-          
-          // Add realistic variation per segment
-          const variation = (Math.random() - 0.5) * 0.1;
-          const adjustedRatio = Math.max(0.1, Math.min(1.0, flowRatio + variation));
-          
-          trafficData.push({
-            segmentId: segmentId,
-            ratio: adjustedRatio
-          });
-        }
-        
-        console.log(`✅ Fetched traffic for ${road.name}`);
-        
-      } catch (error) {
-        console.log(`⚠️ Failed to fetch traffic for ${road.name}:`, error.message);
-        // Use synthetic data for failed requests
-        const segmentCount = road.priority === 'high' ? 8 : road.priority === 'medium' ? 4 : 2;
-        for (let i = 0; i < segmentCount; i++) {
-          const segmentId = `here-${index}-${i}`;
-          trafficData.push({
-            segmentId: segmentId,
-            ratio: generateTimeBasedTrafficRatio(road.type)
-          });
-        }
-      }
+    // Single bounding box for all of North Vancouver (Gemini's approach)
+    // Format: West Longitude, South Latitude, East Longitude, North Latitude  
+    const northVanBBox = "-123.187,49.300,-123.020,49.400";
+    
+    const response = await axios.get(HERE_BASE_URL, {
+      params: {
+        'in': `bbox:${northVanBBox}`,
+        'locationReferencing': 'shape',
+        'apikey': HERE_API_KEY
+      },
+      timeout: 10000
+    });
+    
+    console.log(`✅ HERE API returned ${response.data?.results?.length || 0} traffic segments`);
+    
+    if (!response.data || !response.data.results || response.data.results.length === 0) {
+      console.log('⚠️ No traffic data in HERE response, using synthetic data');
+      return generateSyntheticTrafficData();
     }
     
+    // Convert HERE traffic segments to our format
+    const trafficData = [];
+    
+    response.data.results.forEach((segment, index) => {
+      // Extract traffic flow data
+      const currentFlow = segment.currentFlow || {};
+      const freeFlow = segment.freeFlow || {};
+      
+      const currentSpeed = currentFlow.speed || 50;
+      const freeFlowSpeed = freeFlow.speed || 50;
+      const flowRatio = freeFlowSpeed > 0 ? Math.min(1.0, currentSpeed / freeFlowSpeed) : 1.0;
+      
+      // Create segment data with real coordinates from HERE
+      const coordinates = segment.location?.shape || [];
+      const segmentId = `here-live-${index}`;
+      
+      trafficData.push({
+        segmentId: segmentId,
+        ratio: Math.max(0.1, flowRatio),
+        coordinates: coordinates, // Real road geometry from HERE
+        speed: currentSpeed,
+        freeFlowSpeed: freeFlowSpeed,
+        jamFactor: currentFlow.jamFactor || 0,
+        confidence: currentFlow.confidence || 1.0
+      });
+    });
+    
+    console.log(`✅ Processed ${trafficData.length} live traffic segments`);
     return trafficData;
     
   } catch (error) {
-    console.log('❌ HERE API failed, falling back to synthetic data:', error.message);
+    console.log('❌ HERE API failed, falling back to synthetic data:', error.response?.status, error.message);
     return generateSyntheticTrafficData();
   }
 };
