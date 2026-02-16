@@ -179,7 +179,7 @@ const fetchHereTrafficData = async () => {
         coordinates: geojsonCoords,
         type: 'road', // HERE doesn't categorize, so use generic
         originalData: {
-          shape: coordinates,
+          shape: shape,
           currentFlow: currentFlow,
           freeFlow: freeFlow
         }
