@@ -141,8 +141,9 @@ const fetchHereTrafficData = async () => {
       const currentFlow = segment.currentFlow || {};
       const freeFlow = segment.freeFlow || {};
       
+      // HERE API puts free flow speed inside currentFlow object
       const currentSpeed = currentFlow.speed || 50;
-      const freeFlowSpeed = freeFlow.speed || 50;
+      const freeFlowSpeed = currentFlow.freeFlow || freeFlow.speed || currentSpeed || 50;
       const flowRatio = freeFlowSpeed > 0 ? Math.min(1.0, currentSpeed / freeFlowSpeed) : 1.0;
       
       // Create segment data with real coordinates from HERE
