@@ -275,10 +275,10 @@ const collectTrafficData = async () => {
     
     const { trafficData, segmentMetadata } = await fetchHereTrafficData();
     
-    // Update segment data with new HERE metadata
+    // Replace segment data entirely with new HERE metadata
     if (segmentMetadata && Object.keys(segmentMetadata).length > 0) {
-      Object.assign(segmentData, segmentMetadata);
-      console.log(`📍 Updated segment metadata for ${Object.keys(segmentMetadata).length} segments`);
+      segmentData = segmentMetadata; // REPLACE, don't merge
+      console.log(`📍 Replaced segment data with ${Object.keys(segmentMetadata).length} HERE segments`);
     }
     
     // Convert to interval format
