@@ -109,11 +109,6 @@ const fetchHereTrafficData = async () => {
     return { trafficData: syntheticData, segmentMetadata: {} };
   }
   
-  // Temporarily use synthetic data while debugging HERE API integration
-  console.log('🚧 Using synthetic data temporarily while fixing HERE API integration');
-  const syntheticData = generateSyntheticTrafficData();
-  return { trafficData: syntheticData, segmentMetadata: {} };
-  
   try {
     console.log('Fetching traffic data from HERE API (single bounding box)...');
     
@@ -151,17 +146,21 @@ const fetchHereTrafficData = async () => {
       const flowRatio = freeFlowSpeed > 0 ? Math.min(1.0, currentSpeed / freeFlowSpeed) : 1.0;
       
       // Create segment data with real coordinates from HERE
-      const coordinates = segment.location?.shape || [];
       const segmentId = `here-0-${index}`;
       
-      // Convert HERE coordinates to GeoJSON format safely
+      // Extract coordinates from HERE API's nested structure
       let geojsonCoords = [];
-      if (coordinates && Array.isArray(coordinates)) {
-        geojsonCoords = coordinates.map(coord => {
-          if (coord && typeof coord === 'object') {
-            return [coord.lng || coord.lon || coord[1] || 0, coord.lat || coord[0] || 0];
+      const shape = segment.location?.shape;
+      if (shape && shape.links && Array.isArray(shape.links)) {
+        // Flatten all points from all links into a single coordinate array
+        shape.links.forEach(link => {
+          if (link.points && Array.isArray(link.points)) {
+            link.points.forEach(point => {
+              if (point.lat && point.lng) {
+                geojsonCoords.push([point.lng, point.lat]);
+              }
+            });
           }
-          return [0, 0]; // fallback
         });
       }
       
