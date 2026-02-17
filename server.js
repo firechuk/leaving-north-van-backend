@@ -59,6 +59,14 @@ let trafficIntervals = [];
 let segmentData = {};
 let isCollecting = false;
 
+// Counter-flow data storage
+let counterFlowData = {
+  currentStatus: null, // 'outbound-1', 'outbound-2', etc.
+  statusSince: null, // timestamp when current status started
+  lastChecked: null, // last scrape timestamp
+  history: [] // array of status changes for pattern analysis
+};
+
 // Generate segments from road bboxes
 const initializeSegments = () => {
   console.log('Initializing North Vancouver road segments...');
@@ -268,6 +276,111 @@ const generateTimeBasedTrafficRatio = (roadType, priority = 'medium', hour = nul
   return Math.max(0.1, Math.min(1.0, baseRatio));
 };
 
+// Lions Gate Bridge Counter-Flow Data Collection
+const BC_ATIS_URL = 'http://www.th.gov.bc.ca/ATIS/lgcws/private_status.htm';
+
+const scrapeCounterFlowData = async () => {
+  try {
+    console.log('🌉 Scraping Lions Gate counter-flow data...');
+    
+    const response = await axios.get(BC_ATIS_URL, {
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; TrafficMonitor/1.0)'
+      }
+    });
+    
+    // Parse HTML for VDS ID: 201 data
+    const html = response.data;
+    const vds201Match = html.match(/VDS ID:\s*201[\s\S]*?(?=VDS ID:|$)/i);
+    
+    if (!vds201Match) {
+      console.log('⚠️ Could not find VDS ID: 201 in response');
+      return null;
+    }
+    
+    const vds201Section = vds201Match[0];
+    
+    // Parse lane statuses
+    const lane1Closed = /Lane 1[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
+    const lane2Closed = /Lane 2[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
+    
+    // Determine counter-flow configuration
+    let status;
+    let lanesOutbound;
+    
+    if (lane1Closed && lane2Closed) {
+      status = 'outbound-0'; // Both lanes closed (maintenance?)
+      lanesOutbound = 0;
+    } else if (lane1Closed && !lane2Closed) {
+      status = 'outbound-1'; // 1 lane outbound, 2 inbound
+      lanesOutbound = 1;
+    } else if (!lane1Closed && !lane2Closed) {
+      status = 'outbound-2'; // 2 lanes outbound, 1 inbound  
+      lanesOutbound = 2;
+    } else {
+      status = 'outbound-unknown';
+      lanesOutbound = 1; // fallback
+    }
+    
+    const timestamp = new Date().toISOString();
+    
+    console.log(`✅ Lions Gate status: ${status} (${lanesOutbound} lanes outbound)`);
+    
+    return {
+      status,
+      lanesOutbound,
+      timestamp,
+      rawData: {
+        lane1Closed,
+        lane2Closed,
+        vds201Section: vds201Section.substring(0, 500) // First 500 chars for debugging
+      }
+    };
+    
+  } catch (error) {
+    console.log('❌ Counter-flow scraping failed:', error.message);
+    return null;
+  }
+};
+
+const updateCounterFlowData = async () => {
+  const newData = await scrapeCounterFlowData();
+  
+  if (!newData) return; // Skip update if scraping failed
+  
+  const previousStatus = counterFlowData.currentStatus;
+  const statusChanged = previousStatus !== newData.status;
+  
+  if (statusChanged) {
+    // Log status change
+    console.log(`🔄 Counter-flow changed: ${previousStatus || 'unknown'} → ${newData.status}`);
+    
+    // Add to history
+    counterFlowData.history.push({
+      from: previousStatus,
+      to: newData.status,
+      timestamp: newData.timestamp,
+      duration: previousStatus && counterFlowData.statusSince ? 
+        new Date(newData.timestamp) - new Date(counterFlowData.statusSince) : null
+    });
+    
+    // Keep last 100 changes only
+    if (counterFlowData.history.length > 100) {
+      counterFlowData.history = counterFlowData.history.slice(-100);
+    }
+    
+    // Update current status
+    counterFlowData.statusSince = newData.timestamp;
+  }
+  
+  // Always update these
+  counterFlowData.currentStatus = newData.status;
+  counterFlowData.lastChecked = newData.timestamp;
+  counterFlowData.lanesOutbound = newData.lanesOutbound;
+  counterFlowData.rawData = newData.rawData;
+};
+
 // Collect traffic data
 const collectTrafficData = async () => {
   try {
@@ -332,7 +445,15 @@ app.get('/api/traffic/today', async (req, res) => {
       currentIntervalIndex: trafficIntervals.length - 1,
       maxInterval: trafficIntervals.length - 1,
       coverage: `North Vancouver comprehensive: ${Object.keys(segmentData).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
-      dataSource: 'here-api-synthetic'
+      dataSource: 'here-api-synthetic',
+      counterFlow: {
+        status: counterFlowData.currentStatus,
+        lanesOutbound: counterFlowData.lanesOutbound || 1,
+        statusSince: counterFlowData.statusSince,
+        lastChecked: counterFlowData.lastChecked,
+        durationMs: counterFlowData.statusSince ? 
+          Date.now() - new Date(counterFlowData.statusSince).getTime() : null
+      }
     };
     
     res.json(response);
@@ -359,6 +480,10 @@ const startServer = async () => {
   
   // Collect every 5 minutes
   setInterval(collectTrafficData, 5 * 60 * 1000);
+  
+  // Collect counter-flow data every 60 seconds
+  await updateCounterFlowData(); // Initial collection
+  setInterval(updateCounterFlowData, 60 * 1000);
   
   app.listen(PORT, () => {
     console.log(`🌐 Server running on port ${PORT}`);
