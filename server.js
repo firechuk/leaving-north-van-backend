@@ -4,6 +4,8 @@ const axios = require('axios');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const cheerio = require('cheerio');
+const TrafficDatabase = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -58,6 +60,15 @@ const NORTH_VAN_ROADS = [
 let trafficIntervals = [];
 let segmentData = {};
 let isCollecting = false;
+
+// Database integration
+let db;
+if (process.env.DATABASE_URL) {
+  db = new TrafficDatabase();
+  console.log('✅ Database integration enabled');
+} else {
+  console.log('⚠️  No DATABASE_URL - using memory storage only');
+}
 
 // Counter-flow data storage
 let counterFlowData = {
@@ -411,6 +422,15 @@ const collectTrafficData = async () => {
       trafficIntervals = trafficIntervals.slice(-288);
     }
     
+    // Save to database if available
+    if (db) {
+      try {
+        await db.saveTrafficSnapshot(interval, segmentMetadata, counterFlowData);
+      } catch (error) {
+        console.error('❌ Database save failed, continuing with memory storage');
+      }
+    }
+    
     console.log(`✅ Collected data for ${trafficData.length} segments. Total intervals: ${trafficIntervals.length}`);
     
   } catch (error) {
@@ -431,21 +451,57 @@ app.get('/health', (req, res) => {
 
 app.get('/api/traffic/today', async (req, res) => {
   try {
-    console.log(`📊 API Request: /api/traffic/today - ${trafficIntervals.length} intervals available`);
+    let response;
+    
+    // Try database first if available
+    if (db) {
+      console.log(`📊 API Request: /api/traffic/today - checking database...`);
+      const dbData = await db.getTodayTrafficData();
+      
+      if (dbData && dbData.intervals.length > 0) {
+        response = {
+          intervals: dbData.intervals,
+          segments: dbData.segments,
+          totalSegments: Object.keys(dbData.segments).length,
+          currentIntervalIndex: dbData.intervals.length - 1,
+          maxInterval: dbData.intervals.length - 1,
+          coverage: `North Vancouver comprehensive: ${Object.keys(dbData.segments).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
+          dataSource: 'database-persistent',
+          counterFlow: {
+            status: dbData.counterFlow.currentStatus,
+            lanesOutbound: dbData.counterFlow.lanesOutbound || 1,
+            statusSince: dbData.counterFlow.statusSince,
+            lastChecked: dbData.counterFlow.lastChecked,
+            durationMs: dbData.counterFlow.statusSince ? 
+              Date.now() - new Date(dbData.counterFlow.statusSince).getTime() : null
+          },
+          fromDatabase: true,
+          dbRecordCount: dbData.recordCount
+        };
+        console.log(`✅ Served ${dbData.intervals.length} intervals from database`);
+        res.json(response);
+        return;
+      } else {
+        console.log('📊 No database data found, falling back to memory...');
+      }
+    }
+    
+    // Fallback to memory storage
+    console.log(`📊 API Request: /api/traffic/today - ${trafficIntervals.length} intervals available in memory`);
     
     // If no data, collect some now
     if (trafficIntervals.length === 0) {
       await collectTrafficData();
     }
     
-    const response = {
+    response = {
       intervals: trafficIntervals,
       segments: segmentData,
       totalSegments: Object.keys(segmentData).length,
       currentIntervalIndex: trafficIntervals.length - 1,
       maxInterval: trafficIntervals.length - 1,
       coverage: `North Vancouver comprehensive: ${Object.keys(segmentData).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
-      dataSource: 'here-api-synthetic',
+      dataSource: 'memory-ephemeral',
       counterFlow: {
         status: counterFlowData.currentStatus,
         lanesOutbound: counterFlowData.lanesOutbound || 1,
@@ -453,7 +509,8 @@ app.get('/api/traffic/today', async (req, res) => {
         lastChecked: counterFlowData.lastChecked,
         durationMs: counterFlowData.statusSince ? 
           Date.now() - new Date(counterFlowData.statusSince).getTime() : null
-      }
+      },
+      fromDatabase: false
     };
     
     res.json(response);
@@ -462,6 +519,72 @@ app.get('/api/traffic/today', async (req, res) => {
     console.error('❌ Error in /api/traffic/today:', error);
     res.status(500).json({ 
       error: 'Failed to fetch traffic data',
+      details: error.message 
+    });
+  }
+});
+
+// Database statistics endpoint
+app.get('/api/database/stats', async (req, res) => {
+  try {
+    if (db) {
+      const stats = await db.getStats();
+      res.json({ 
+        database: true, 
+        stats,
+        message: 'Database operational'
+      });
+    } else {
+      res.json({ 
+        database: false, 
+        message: 'Using memory storage - no DATABASE_URL configured'
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ 
+      database: false,
+      error: error.message 
+    });
+  }
+});
+
+// Counterflow-specific endpoint
+app.get('/api/counterflow/status', async (req, res) => {
+  try {
+    const now = Date.now();
+    const response = {
+      isActive: counterFlowData.currentStatus === 'outbound-2', // 2 lanes outbound = counterflow
+      status: counterFlowData.currentStatus,
+      lanesOutbound: counterFlowData.lanesOutbound || 1,
+      stateStartTime: counterFlowData.statusSince ? new Date(counterFlowData.statusSince).getTime() : now,
+      currentDuration: counterFlowData.statusSince ? now - new Date(counterFlowData.statusSince).getTime() : 0,
+      lastChecked: counterFlowData.lastChecked ? new Date(counterFlowData.lastChecked).getTime() : null,
+      lastUpdated: counterFlowData.lastChecked ? new Date(counterFlowData.lastChecked).getTime() : null,
+      isHealthy: counterFlowData.lastChecked && (now - new Date(counterFlowData.lastChecked).getTime()) < 5 * 60 * 1000, // healthy if checked within 5 minutes
+      rawStatus: counterFlowData.currentStatus
+    };
+    
+    res.json(response);
+  } catch (error) {
+    res.status(500).json({ 
+      error: 'Failed to get counterflow status',
+      details: error.message 
+    });
+  }
+});
+
+// Counterflow history endpoint
+app.get('/api/counterflow/history', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    res.json({
+      history: counterFlowData.history.slice(-limit),
+      totalChanges: counterFlowData.history.length,
+      currentStatus: counterFlowData.currentStatus
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      error: 'Failed to get counterflow history',
       details: error.message 
     });
   }
