@@ -4,7 +4,7 @@ const axios = require('axios');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const cheerio = require('cheerio');
+// const cheerio = require('cheerio'); // Removed for Node compatibility
 const TrafficDatabase = require('./database');
 
 const app = express();
