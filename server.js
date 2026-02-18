@@ -427,7 +427,8 @@ const collectTrafficData = async () => {
       try {
         await db.saveTrafficSnapshot(interval, segmentMetadata, counterFlowData);
       } catch (error) {
-        console.error('❌ Database save failed, continuing with memory storage');
+        console.error('❌ Database save failed, continuing with memory storage:', error.message);
+        console.error('❌ Full database error:', error);
       }
     }
     

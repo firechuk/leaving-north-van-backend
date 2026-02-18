@@ -45,7 +45,7 @@ class TrafficDatabase {
             `;
             
             const values = [
-                now,
+                now.toISOString(), // Convert Date to ISO string for TEXT column
                 dateKey,
                 intervalIndex, 
                 JSON.stringify(snapshotData)
@@ -55,7 +55,8 @@ class TrafficDatabase {
             console.log(`✅ Saved traffic snapshot ${dateKey}-${intervalIndex} (id: ${result.rows[0].id})`);
             return result.rows[0].id;
         } catch (error) {
-            console.error('❌ Failed to save traffic snapshot:', error);
+            console.error('❌ Failed to save traffic snapshot:', error.message);
+            console.error('❌ Full error details:', error);
             throw error;
         }
     }
