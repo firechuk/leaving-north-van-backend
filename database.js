@@ -37,10 +37,6 @@ class TrafficDatabase {
             const query = `
                 INSERT INTO traffic_snapshots (observed_at, date_key, interval_index, raw_data)
                 VALUES ($1, $2, $3, $4)
-                ON CONFLICT (date_key, interval_index)
-                DO UPDATE SET 
-                    raw_data = EXCLUDED.raw_data,
-                    observed_at = EXCLUDED.observed_at
                 RETURNING id;
             `;
             
