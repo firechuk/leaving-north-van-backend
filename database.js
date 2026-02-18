@@ -104,11 +104,11 @@ class TrafficDatabase {
         }
     }
     
-    // Calculate 5-minute interval index (0-287 for 24 hours)
+    // Calculate 2-minute interval index (0-719 for 24 hours)
     calculateIntervalIndex(date) {
         const hours = date.getHours();
         const minutes = date.getMinutes();
-        return Math.floor((hours * 60 + minutes) / 5);
+        return Math.floor((hours * 60 + minutes) / 2);
     }
     
     // Get database statistics

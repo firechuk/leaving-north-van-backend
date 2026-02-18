@@ -417,9 +417,9 @@ const collectTrafficData = async () => {
     
     trafficIntervals.push(interval);
     
-    // Keep last 24 hours (288 5-minute intervals)
-    if (trafficIntervals.length > 288) {
-      trafficIntervals = trafficIntervals.slice(-288);
+    // Keep last 24 hours (720 2-minute intervals)
+    if (trafficIntervals.length > 720) {
+      trafficIntervals = trafficIntervals.slice(-720);
     }
     
     // Save to database if available
@@ -602,8 +602,8 @@ const startServer = async () => {
   isCollecting = true;
   await collectTrafficData();
   
-  // Collect every 5 minutes
-  setInterval(collectTrafficData, 5 * 60 * 1000);
+  // Collect every 2 minutes
+  setInterval(collectTrafficData, 2 * 60 * 1000);
   
   // Collect counter-flow data every 60 seconds
   await updateCounterFlowData(); // Initial collection
