@@ -122,10 +122,10 @@ const fetchHereTrafficData = async () => {
   }
   
   try {
-    console.log('Fetching traffic data from HERE API (single bounding box)...');
+    console.log('Fetching traffic data from HERE API (filtered for Tier 1+2 roads only)...');
     
-    // Single bounding box for all of North Vancouver (Gemini's approach)
-    // Format: West Longitude, South Latitude, East Longitude, North Latitude  
+    // OPTIMIZATION: Still use single bounding box but filter results to only Tier 1+2 roads
+    // This reduces segments from 279 to ~45 while maintaining API efficiency
     const northVanBBox = "-123.187,49.300,-123.020,49.400";
     
     const response = await axios.get(HERE_BASE_URL, {
@@ -144,11 +144,44 @@ const fetchHereTrafficData = async () => {
       return generateSyntheticTrafficData();
     }
     
-    // Convert HERE traffic segments to our format
+    // OPTIMIZATION: Filter segments to only Tier 1+2 roads before processing
+    // Helper function to check if coordinates intersect with any of our critical roads
+    const isSegmentInCriticalRoads = (segment) => {
+      const shape = segment.location?.shape;
+      if (!shape || !shape.links || !Array.isArray(shape.links)) return false;
+      
+      // Extract coordinates from segment
+      const segmentCoords = [];
+      shape.links.forEach(link => {
+        if (link.points && Array.isArray(link.points)) {
+          link.points.forEach(point => {
+            if (point.lat && point.lng) {
+              segmentCoords.push([point.lng, point.lat]);
+            }
+          });
+        }
+      });
+      
+      if (segmentCoords.length === 0) return false;
+      
+      // Check if any coordinate falls within any of our critical road bounding boxes
+      return NORTH_VAN_ROADS.some(road => {
+        const [minLat, minLng, maxLat, maxLng] = road.bbox.split(',').map(Number);
+        return segmentCoords.some(([lng, lat]) => {
+          return lng >= minLng && lng <= maxLng && lat >= minLat && lat <= maxLat;
+        });
+      });
+    };
+    
+    // Filter segments to only critical roads first
+    const filteredSegments = response.data.results.filter(isSegmentInCriticalRoads);
+    console.log(`🎯 Filtered ${response.data.results.length} segments to ${filteredSegments.length} critical road segments`);
+    
+    // Convert filtered HERE traffic segments to our format
     const trafficData = [];
     const segmentMetadata = {};
     
-    response.data.results.forEach((segment, index) => {
+    filteredSegments.forEach((segment, index) => {
       // Extract traffic flow data
       const currentFlow = segment.currentFlow || {};
       const freeFlow = segment.freeFlow || {};
@@ -199,7 +232,7 @@ const fetchHereTrafficData = async () => {
       };
     });
     
-    console.log(`✅ Processed ${trafficData.length} live traffic segments`);
+    console.log(`✅ Processed ${trafficData.length} critical road segments (filtered from ${response.data.results.length} total)`);
     return { trafficData, segmentMetadata };
     
   } catch (error) {
