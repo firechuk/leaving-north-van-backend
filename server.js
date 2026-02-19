@@ -635,7 +635,7 @@ app.get('/api/traffic/today', async (req, res) => {
           fromDatabase: true,
           dbRecordCount: dbData.recordCount
         };
-        console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database`);
+        console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
         res.json(response);
         return;
       } else {
