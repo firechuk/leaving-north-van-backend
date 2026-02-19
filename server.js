@@ -515,7 +515,19 @@ const collectTrafficData = async () => {
     // Save to database if available
     if (db) {
       try {
-        await db.saveTrafficSnapshot(interval, segmentMetadata, counterFlowData);
+        // Clean segmentMetadata for database storage (remove complex HERE API objects)
+        const cleanSegmentData = {};
+        Object.keys(segmentMetadata).forEach(segmentId => {
+          const segment = segmentMetadata[segmentId];
+          cleanSegmentData[segmentId] = {
+            name: segment.name,
+            coordinates: segment.coordinates,
+            type: segment.type
+            // Skip originalData - contains circular references from HERE API
+          };
+        });
+        
+        await db.saveTrafficSnapshot(interval, cleanSegmentData, counterFlowData);
       } catch (error) {
         console.error('❌ Database save failed, continuing with memory storage:', error.message);
         console.error('❌ Full database error:', error);

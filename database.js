@@ -104,19 +104,23 @@ class TrafficDatabase {
                     segments = snapshot.segmentData; // Same for all intervals
                     counterFlow = snapshot.counterFlowData; // Latest state
                 } catch (parseError) {
-                    console.error(`❌ JSON parse error for row ${index}:`, parseError.message);
-                    console.error(`❌ Raw data preview:`, row.raw_data?.substring(0, 200));
+                    console.error(`❌ JSON parse error for row ${index} (id: ${row.id || 'unknown'}):`, parseError.message);
+                    console.error(`❌ Raw data preview:`, row.raw_data?.substring(0, 100) + '...');
+                    // Skip corrupted records but continue processing others
                 }
             });
             
-            console.log(`✅ DB read success: Reconstructed ${intervals.length} intervals, ${Object.keys(segments).length} segments`);
+            console.log(`✅ DB read success: Reconstructed ${intervals.length} intervals, ${Object.keys(segments).length} segments from ${result.rows.length} total rows`);
             
+            // Return data even if some records were corrupted (better than complete failure)
             return {
                 intervals,
                 segments,
                 counterFlow,
                 fromDatabase: true,
-                recordCount: result.rows.length
+                recordCount: result.rows.length,
+                validRecords: intervals.length,
+                corruptedRecords: result.rows.length - intervals.length
             };
         } catch (error) {
             console.error('❌ Failed to get traffic data from database:', error);
