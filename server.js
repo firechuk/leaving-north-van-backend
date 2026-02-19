@@ -48,8 +48,9 @@ const NORTH_VAN_ROADS = [
   
   // ADDITIONAL ROADS - Fill coverage gaps identified by visual inspection
   { name: 'Keith Road East', bbox: '49.311,-123.050,49.313,-123.020', type: 'arterial', priority: 'medium' },
-  { name: 'Low Level Road', bbox: '49.309,-123.080,49.312,-123.020', type: 'arterial', priority: 'medium' },
-  { name: '3rd Street East Extended', bbox: '49.314,-123.075,49.318,-123.018', type: 'arterial', priority: 'medium' },
+  { name: 'Low Level Road Extended', bbox: '49.308,-123.090,49.315,-123.015', type: 'arterial', priority: 'medium' },
+  { name: '3rd Street Central (Moody to Gladstone)', bbox: '49.315,-123.085,49.318,-123.065', type: 'arterial', priority: 'medium' },
+  { name: '3rd Street East Extended', bbox: '49.314,-123.065,49.318,-123.018', type: 'arterial', priority: 'medium' },
   { name: 'Mountain Highway South', bbox: '49.320,-123.052,49.330,-123.048', type: 'arterial', priority: 'medium' },
   { name: 'Brooksbank Avenue South', bbox: '49.312,-123.055,49.320,-123.050', type: 'arterial', priority: 'medium' },
   { name: 'Arborlynn Drive', bbox: '49.325,-123.040,49.330,-123.035', type: 'collector', priority: 'low' },
