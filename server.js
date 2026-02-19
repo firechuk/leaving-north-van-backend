@@ -44,7 +44,18 @@ const NORTH_VAN_ROADS = [
   { name: 'Lonsdale Avenue at Marine Drive', bbox: '49.319,-123.076,49.321,-123.072', type: 'arterial', priority: 'medium' },
   { name: 'Phibbs Exchange Area', bbox: '49.294,-123.026,49.296,-123.022', type: 'transit', priority: 'medium' },
   { name: 'Highway 1 at Taylor Way Interchange', bbox: '49.327,-123.140,49.329,-123.138', type: 'ramp', priority: 'medium' },
-  { name: 'Fern Street Overpass / Mt Seymour Connection', bbox: '49.324,-123.040,49.326,-123.036', type: 'arterial', priority: 'medium' }
+  { name: 'Fern Street Overpass / Mt Seymour Connection', bbox: '49.324,-123.040,49.326,-123.036', type: 'arterial', priority: 'medium' },
+  
+  // ADDITIONAL ROADS - Fill coverage gaps identified by visual inspection
+  { name: 'Keith Road East', bbox: '49.311,-123.050,49.313,-123.020', type: 'arterial', priority: 'medium' },
+  { name: 'Low Level Road', bbox: '49.309,-123.080,49.312,-123.020', type: 'arterial', priority: 'medium' },
+  { name: '3rd Street East', bbox: '49.315,-123.060,49.317,-123.020', type: 'arterial', priority: 'medium' },
+  { name: 'Mountain Highway South', bbox: '49.320,-123.052,49.330,-123.048', type: 'arterial', priority: 'medium' },
+  { name: 'Brooksbank Avenue South', bbox: '49.312,-123.055,49.320,-123.050', type: 'arterial', priority: 'medium' },
+  { name: 'Arborlynn Drive', bbox: '49.325,-123.040,49.330,-123.035', type: 'collector', priority: 'low' },
+  { name: 'Highway 1 - Ironworkers to 21st Street', bbox: '49.290,-123.030,49.295,-123.120', type: 'highway', priority: 'high' },
+  { name: 'Taylor Way North (Hwy 1 to Inglewood)', bbox: '49.328,-123.140,49.340,-123.136', type: 'arterial', priority: 'medium' },
+  { name: 'Grand Boulevard', bbox: '49.315,-123.076,49.340,-123.072', type: 'arterial', priority: 'medium' }
 ];
 
 // Data storage
