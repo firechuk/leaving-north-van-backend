@@ -177,6 +177,35 @@ const fetchHereTrafficData = async () => {
     const filteredSegments = response.data.results.filter(isSegmentInCriticalRoads);
     console.log(`🎯 Filtered ${response.data.results.length} segments to ${filteredSegments.length} critical road segments`);
     
+    // DEBUG: Log some example segments that were kept vs rejected for troubleshooting
+    const kept = response.data.results.filter(isSegmentInCriticalRoads);
+    const rejected = response.data.results.filter(seg => !isSegmentInCriticalRoads(seg));
+    
+    console.log('🔍 DEBUG - Sample segments KEPT:');
+    kept.slice(0, 3).forEach((seg, i) => {
+      const coords = seg.location?.shape?.links?.[0]?.points?.[0];
+      console.log(`  ${i+1}. ${coords?.lat.toFixed(6)},${coords?.lng.toFixed(6)} - Road: ${seg.location?.description || 'Unknown'}`);
+    });
+    
+    console.log('🔍 DEBUG - Sample segments REJECTED:');  
+    rejected.slice(0, 3).forEach((seg, i) => {
+      const coords = seg.location?.shape?.links?.[0]?.points?.[0];
+      console.log(`  ${i+1}. ${coords?.lat.toFixed(6)},${coords?.lng.toFixed(6)} - Road: ${seg.location?.description || 'Unknown'}`);
+    });
+    
+    // DEBUG: Specifically look for major infrastructure keywords
+    const majorRoads = response.data.results.filter(seg => {
+      const desc = (seg.location?.description || '').toLowerCase();
+      return desc.includes('highway') || desc.includes('bridge') || desc.includes('trans-canada') || desc.includes('ironworkers') || desc.includes('lions gate');
+    });
+    
+    console.log(`🏗️  DEBUG - Found ${majorRoads.length} segments with major infrastructure keywords:`);
+    majorRoads.slice(0, 5).forEach((seg, i) => {
+      const coords = seg.location?.shape?.links?.[0]?.points?.[0];
+      const kept = isSegmentInCriticalRoads(seg) ? 'KEPT' : 'REJECTED';
+      console.log(`  ${i+1}. ${kept}: ${seg.location?.description} at ${coords?.lat.toFixed(6)},${coords?.lng.toFixed(6)}`);
+    });
+    
     // Convert filtered HERE traffic segments to our format
     const trafficData = [];
     const segmentMetadata = {};
