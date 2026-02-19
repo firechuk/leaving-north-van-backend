@@ -241,12 +241,11 @@ const fetchHereTrafficData = async () => {
       
       trafficData.push({
         segmentId: segmentId,
-        ratio: 0.9, // DEBUG: Force all segments to show as GREEN (good flow) for visualization
+        ratio: Math.max(0.1, flowRatio), // Real traffic data restored
         speed: currentSpeed,
         freeFlowSpeed: freeFlowSpeed,
         jamFactor: currentFlow.jamFactor || 0,
-        confidence: currentFlow.confidence || 1.0,
-        debugMode: true // Flag to indicate this is debug data
+        confidence: currentFlow.confidence || 1.0
       });
       
       // Store segment metadata for frontend (with coordinate validation)
@@ -267,7 +266,6 @@ const fetchHereTrafficData = async () => {
     });
     
     console.log(`✅ Processed ${trafficData.length} critical road segments (filtered from ${response.data.results.length} total)`);
-    console.log(`🟢 DEBUG MODE: All segments set to GREEN for visualization testing`);
     
     // DEBUG: Check coordinate quality
     const segmentsWithCoords = Object.values(segmentMetadata).filter(seg => seg.coordinates && seg.coordinates.length >= 2);
