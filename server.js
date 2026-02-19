@@ -49,12 +49,14 @@ const NORTH_VAN_ROADS = [
   // ADDITIONAL ROADS - Fill coverage gaps identified by visual inspection
   { name: 'Keith Road East', bbox: '49.311,-123.050,49.313,-123.020', type: 'arterial', priority: 'medium' },
   { name: 'Low Level Road', bbox: '49.309,-123.080,49.312,-123.020', type: 'arterial', priority: 'medium' },
-  { name: '3rd Street East', bbox: '49.315,-123.060,49.317,-123.020', type: 'arterial', priority: 'medium' },
+  { name: '3rd Street East Extended', bbox: '49.314,-123.075,49.318,-123.018', type: 'arterial', priority: 'medium' },
   { name: 'Mountain Highway South', bbox: '49.320,-123.052,49.330,-123.048', type: 'arterial', priority: 'medium' },
   { name: 'Brooksbank Avenue South', bbox: '49.312,-123.055,49.320,-123.050', type: 'arterial', priority: 'medium' },
   { name: 'Arborlynn Drive', bbox: '49.325,-123.040,49.330,-123.035', type: 'collector', priority: 'low' },
-  { name: 'Highway 1 - Ironworkers to 21st Street', bbox: '49.290,-123.030,49.295,-123.120', type: 'highway', priority: 'high' },
-  { name: 'Taylor Way North (Hwy 1 to Inglewood)', bbox: '49.328,-123.140,49.340,-123.136', type: 'arterial', priority: 'medium' },
+  { name: 'Highway 1 West (21st to Capilano)', bbox: '49.325,-123.120,49.330,-123.110', type: 'highway', priority: 'high' },
+  { name: 'Highway 1 Central (Capilano to Lonsdale)', bbox: '49.325,-123.110,49.330,-123.070', type: 'highway', priority: 'high' },
+  { name: 'Highway 1 East (Lonsdale to Ironworkers)', bbox: '49.290,-123.070,49.295,-123.025', type: 'highway', priority: 'high' },
+  { name: 'Taylor Way Upper (Hwy 1 to British Properties)', bbox: '49.328,-123.142,49.350,-123.135', type: 'arterial', priority: 'medium' },
   { name: 'Grand Boulevard', bbox: '49.315,-123.076,49.340,-123.072', type: 'arterial', priority: 'medium' }
 ];
 
