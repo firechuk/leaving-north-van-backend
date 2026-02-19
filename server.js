@@ -29,7 +29,7 @@ const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_ROADS = [
   // TIER 1 - CRITICAL ROADS (high priority = 4 segments each for focused monitoring)
   { name: 'Lions Gate Bridge', bbox: '49.314,-123.140,49.316,-123.136', type: 'bridge', priority: 'high' },
-  { name: 'Ironworkers Memorial Bridge', bbox: '49.292,-123.025,49.295,-123.021', type: 'bridge', priority: 'high' },
+  { name: 'Ironworkers Memorial Bridge', bbox: '49.292,-123.027,49.306,-123.020', type: 'bridge', priority: 'high' },
   { name: 'Highway 1 - The Cut (Lynn Valley to Ironworkers)', bbox: '49.324,-123.060,49.330,-123.020', type: 'highway', priority: 'high' },
   { name: 'Taylor Way (Marine to Hwy 1)', bbox: '49.324,-123.140,49.328,-123.138', type: 'arterial', priority: 'high' },
   { name: 'Marine Drive (Taylor to Five-Way)', bbox: '49.324,-123.140,49.326,-123.070', type: 'arterial', priority: 'high' },
