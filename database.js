@@ -133,6 +133,25 @@ class TrafficDatabase {
             return [];
         }
     }
+    
+    // Clear all traffic data (emergency database cleanup)
+    async clearAllTrafficData() {
+        try {
+            console.log('🗑️  Clearing all traffic data from database...');
+            
+            const query = `DELETE FROM traffic_snapshots;`;
+            const result = await this.pool.query(query);
+            
+            console.log(`✅ Cleared ${result.rowCount} traffic snapshots from database`);
+            console.log('💾 Database space freed up - ready for optimized data collection');
+            
+            return { success: true, deletedRows: result.rowCount };
+            
+        } catch (error) {
+            console.error('❌ Failed to clear traffic data:', error);
+            return { success: false, error: error.message };
+        }
+    }
 }
 
 module.exports = TrafficDatabase;

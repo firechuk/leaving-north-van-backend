@@ -476,6 +476,44 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Emergency database clearing endpoint (one-time use)
+app.post('/api/admin/clear-database', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(400).json({
+        error: 'Database not configured',
+        message: 'No DATABASE_URL environment variable found'
+      });
+    }
+    
+    console.log('🚨 ADMIN ACTION: Database clearing requested');
+    const result = await db.clearAllTrafficData();
+    
+    if (result.success) {
+      res.json({
+        success: true,
+        message: `Successfully cleared ${result.deletedRows} traffic snapshots`,
+        freedSpace: 'Database space freed up for optimized collection',
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: result.error,
+        message: 'Failed to clear database'
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Database clearing failed:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'Database clearing operation failed'
+    });
+  }
+});
+
 app.get('/api/traffic/today', async (req, res) => {
   try {
     let response;
