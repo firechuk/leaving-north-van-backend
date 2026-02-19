@@ -58,7 +58,8 @@ const NORTH_VAN_ROADS = [
   { name: 'Highway 1 Central (Capilano to Lonsdale)', bbox: '49.325,-123.110,49.330,-123.070', type: 'highway', priority: 'high' },
   { name: 'Highway 1 East (Lonsdale to Ironworkers)', bbox: '49.290,-123.070,49.295,-123.025', type: 'highway', priority: 'high' },
   { name: 'Taylor Way Upper (Hwy 1 to British Properties)', bbox: '49.328,-123.142,49.350,-123.135', type: 'arterial', priority: 'medium' },
-  { name: 'Grand Boulevard', bbox: '49.315,-123.076,49.340,-123.072', type: 'arterial', priority: 'medium' }
+  { name: 'Grand Boulevard', bbox: '49.315,-123.076,49.340,-123.072', type: 'arterial', priority: 'medium' },
+  { name: 'Main Street Onramp to Highway 1 South', bbox: '49.322,-123.100,49.325,-123.096', type: 'onramp', priority: 'medium' }
 ];
 
 // Data storage
