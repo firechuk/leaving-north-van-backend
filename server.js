@@ -585,9 +585,11 @@ app.get('/api/traffic/today', async (req, res) => {
     // Try database first if available
     if (db) {
       console.log(`📊 API Request: /api/traffic/today - checking database...`);
-      const dbData = await db.getTodayTrafficData();
-      
-      if (dbData && dbData.intervals.length > 0) {
+      try {
+        const dbData = await db.getTodayTrafficData();
+        console.log(`🔍 DB data received: intervals=${dbData?.intervals?.length || 0}, segments=${Object.keys(dbData?.segments || {}).length}`);
+        
+        if (dbData && dbData.intervals.length > 0) {
         response = {
           intervals: dbData.intervals,
           segments: dbData.segments,
@@ -611,7 +613,11 @@ app.get('/api/traffic/today', async (req, res) => {
         res.json(response);
         return;
       } else {
-        console.log('📊 No database data found, falling back to memory...');
+        console.log('📊 No database data found (empty intervals), falling back to memory...');
+      }
+      } catch (dbError) {
+        console.error('❌ Database read error, falling back to memory:', dbError.message);
+        console.error('❌ Full database read error:', dbError);
       }
     }
     

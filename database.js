@@ -61,6 +61,7 @@ class TrafficDatabase {
     async getTodayTrafficData() {
         try {
             const dateKey = new Date().toISOString().split('T')[0];
+            console.log(`🔍 DB READ: Querying for dateKey: ${dateKey}`);
             
             const query = `
                 SELECT interval_index, raw_data, observed_at
@@ -70,8 +71,20 @@ class TrafficDatabase {
             `;
             
             const result = await this.pool.query(query, [dateKey]);
+            console.log(`🔍 DB read result: Found ${result.rows.length} rows for date ${dateKey}`);
             
             if (result.rows.length === 0) {
+                // DEBUG: Check what dates are actually in the database
+                const allDatesQuery = `
+                    SELECT DISTINCT date_key, COUNT(*) as count 
+                    FROM traffic_snapshots 
+                    GROUP BY date_key 
+                    ORDER BY date_key DESC 
+                    LIMIT 5;
+                `;
+                const allDatesResult = await this.pool.query(allDatesQuery);
+                console.log(`🔍 DB dates available:`, allDatesResult.rows);
+                
                 return {
                     intervals: [],
                     segments: {},
@@ -84,12 +97,19 @@ class TrafficDatabase {
             let segments = {};
             let counterFlow = {};
             
-            result.rows.forEach(row => {
-                const snapshot = JSON.parse(row.raw_data);
-                intervals.push(snapshot.intervalData);
-                segments = snapshot.segmentData; // Same for all intervals
-                counterFlow = snapshot.counterFlowData; // Latest state
+            result.rows.forEach((row, index) => {
+                try {
+                    const snapshot = JSON.parse(row.raw_data);
+                    intervals.push(snapshot.intervalData);
+                    segments = snapshot.segmentData; // Same for all intervals
+                    counterFlow = snapshot.counterFlowData; // Latest state
+                } catch (parseError) {
+                    console.error(`❌ JSON parse error for row ${index}:`, parseError.message);
+                    console.error(`❌ Raw data preview:`, row.raw_data?.substring(0, 200));
+                }
             });
+            
+            console.log(`✅ DB read success: Reconstructed ${intervals.length} intervals, ${Object.keys(segments).length} segments`);
             
             return {
                 intervals,
