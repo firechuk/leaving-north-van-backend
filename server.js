@@ -226,6 +226,20 @@ const fetchHereTrafficData = async () => {
       // Extract coordinates from HERE API's nested structure
       let geojsonCoords = [];
       const shape = segment.location?.shape;
+      
+      // DETAILED DEBUG: Log coordinate extraction process
+      if (index < 3) { // Debug first 3 segments
+        console.log(`🔍 COORD DEBUG ${index}: shape=${!!shape}, links=${Array.isArray(shape?.links)}, linksCount=${shape?.links?.length || 0}`);
+        if (shape?.links) {
+          shape.links.forEach((link, linkIdx) => {
+            console.log(`  Link ${linkIdx}: points=${Array.isArray(link.points)}, pointsCount=${link.points?.length || 0}`);
+            if (link.points && linkIdx === 0) {
+              console.log(`  Sample point: ${JSON.stringify(link.points[0])}`);
+            }
+          });
+        }
+      }
+      
       if (shape && shape.links && Array.isArray(shape.links)) {
         // Flatten all points from all links into a single coordinate array
         shape.links.forEach(link => {
@@ -237,6 +251,11 @@ const fetchHereTrafficData = async () => {
             });
           }
         });
+      } else {
+        // DEBUG: Log why coordinate extraction failed
+        if (index < 5) {
+          console.log(`⚠️  COORD FAIL ${index}: shape=${!!shape}, shape.links=${!!shape?.links}, isArray=${Array.isArray(shape?.links)}`);
+        }
       }
       
       trafficData.push({
@@ -260,8 +279,11 @@ const fetchHereTrafficData = async () => {
             freeFlow: freeFlow
           }
         };
+        if (index < 3) {
+          console.log(`✅ COORD SUCCESS ${index}: ${geojsonCoords.length} coordinates extracted`);
+        }
       } else {
-        console.log(`⚠️  Skipping segment ${segmentId} - insufficient coordinates: ${geojsonCoords.length}`);
+        console.log(`❌ COORD FAIL ${segmentId} - insufficient coordinates: ${geojsonCoords.length}`);
       }
     });
     
