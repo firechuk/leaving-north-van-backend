@@ -249,21 +249,34 @@ const fetchHereTrafficData = async () => {
         debugMode: true // Flag to indicate this is debug data
       });
       
-      // Store segment metadata for frontend
-      segmentMetadata[segmentId] = {
-        name: `Traffic Segment ${index + 1}`,
-        coordinates: geojsonCoords,
-        type: 'road', // HERE doesn't categorize, so use generic
-        originalData: {
-          shape: shape,
-          currentFlow: currentFlow,
-          freeFlow: freeFlow
-        }
-      };
+      // Store segment metadata for frontend (with coordinate validation)
+      if (geojsonCoords.length >= 2) {
+        segmentMetadata[segmentId] = {
+          name: `Traffic Segment ${index + 1}`,
+          coordinates: geojsonCoords,
+          type: 'road', // HERE doesn't categorize, so use generic
+          originalData: {
+            shape: shape,
+            currentFlow: currentFlow,
+            freeFlow: freeFlow
+          }
+        };
+      } else {
+        console.log(`⚠️  Skipping segment ${segmentId} - insufficient coordinates: ${geojsonCoords.length}`);
+      }
     });
     
     console.log(`✅ Processed ${trafficData.length} critical road segments (filtered from ${response.data.results.length} total)`);
     console.log(`🟢 DEBUG MODE: All segments set to GREEN for visualization testing`);
+    
+    // DEBUG: Check coordinate quality
+    const segmentsWithCoords = Object.values(segmentMetadata).filter(seg => seg.coordinates && seg.coordinates.length >= 2);
+    console.log(`📍 Segments with valid coordinates: ${segmentsWithCoords.length}/${Object.keys(segmentMetadata).length}`);
+    
+    if (segmentsWithCoords.length > 0) {
+      const sample = segmentsWithCoords[0];
+      console.log(`📍 Sample coordinates: ${sample.coordinates[0]} to ${sample.coordinates[sample.coordinates.length-1]}`);
+    }
     return { trafficData, segmentMetadata };
     
   } catch (error) {
