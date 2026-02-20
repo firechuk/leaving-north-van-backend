@@ -2,8 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 // const cheerio = require('cheerio'); // Removed for Node compatibility
 const TrafficDatabase = require('./database');
@@ -373,80 +371,28 @@ const buildTrackedDebugSegments = () => {
   return trackedSegments;
 };
 
-// Generate segments from road bboxes
-const initializeSegments = () => {
-  console.log('Initializing North Vancouver road segments...');
-  
-  NORTH_VAN_ROADS.forEach((road, roadIndex) => {
-    const [minLat, minLng, maxLat, maxLng] = road.bbox.split(',').map(Number);
-    
-    // OPTIMIZED: Reduced segment counts to solve database crisis
-    // Old: high=8, medium=4, low=2 (282 total segments)
-    // New: high=3, medium=3, low=2 (~45 total segments)
-    const segmentCount = road.priority === 'high' ? 3 : road.priority === 'medium' ? 3 : 2;
-    
-    for (let i = 0; i < segmentCount; i++) {
-      const segmentId = `here-${roadIndex}-${i}`;
-      
-      // Distribute segments along the road bbox
-      const latStep = (maxLat - minLat) / segmentCount;
-      const lngStep = (maxLng - minLng) / segmentCount;
-      
-      const segmentMinLat = minLat + (latStep * i);
-      const segmentMaxLat = minLat + (latStep * (i + 1));
-      const segmentMinLng = minLng + (lngStep * i);
-      const segmentMaxLng = minLng + (lngStep * (i + 1));
-      
-      // Create simple line segment coordinates
-      const coordinates = [
-        [segmentMinLng, segmentMinLat],
-        [segmentMaxLng, segmentMaxLat]
-      ];
-      
-      segmentData[segmentId] = {
-        name: `${road.name} (${i + 1})`,
-        coordinates: coordinates,
-        type: road.type,
-        priority: road.priority,
-        roadIndex: roadIndex,
-        segmentIndex: i
-      };
-    }
-  });
-  
-  console.log(`✅ Initialized ${Object.keys(segmentData).length} segments across ${NORTH_VAN_ROADS.length} roads`);
-};
-
 // Fetch traffic data from HERE API using efficient bounding box approach
 const fetchHereTrafficData = async () => {
-  const buildSyntheticFallback = (dataSourceLabel = 'synthetic-fallback') => {
-    const syntheticData = generateSyntheticTrafficData();
-    const allSegmentMetadata = buildFallbackAllSegmentsFromTracked(segmentData);
-    const trackedSourceIds = Object.entries(segmentData)
-      .map(([segmentId, segment]) => {
-        if (typeof segment?.sourceId === 'string' && segment.sourceId) {
-          return segment.sourceId;
-        }
-        return `tracked-${segmentId}`;
-      });
-
+  const buildNoDataResult = (dataSourceLabel = 'no-data') => {
     return {
-      trafficData: syntheticData,
+      trafficData: [],
       segmentMetadata: {},
-      allSegmentMetadata,
+      allSegmentMetadata: {},
       debugMeta: {
         dataSource: dataSourceLabel,
-        rawSegmentCount: Object.keys(allSegmentMetadata).length,
-        allSegmentCount: Object.keys(allSegmentMetadata).length,
-        filteredSegmentCount: syntheticData.length,
-        trackedSourceIds
+        rawSegmentCount: 0,
+        allSegmentCount: 0,
+        filteredSegmentCount: 0,
+        selectedSegmentCount: 0,
+        filterMode: 'none',
+        trackedSourceIds: []
       }
     };
   };
 
   if (!HERE_API_KEY || HERE_API_KEY === 'YOUR_HERE_API_KEY_NEEDED') {
-    console.log('⚠️ HERE API key not configured, using synthetic data');
-    return buildSyntheticFallback('synthetic-no-here-key');
+    console.log('⚠️ HERE API key not configured; no live traffic data available.');
+    return buildNoDataResult('no-data-no-here-key');
   }
   
   try {
@@ -465,8 +411,8 @@ const fetchHereTrafficData = async () => {
     console.log(`✅ HERE API returned ${rawSegments.length} traffic segments`);
     
     if (rawSegments.length === 0) {
-      console.log('⚠️ No traffic data in HERE response, using synthetic data');
-      return buildSyntheticFallback('synthetic-empty-here-response');
+      console.log('⚠️ HERE API returned no traffic segments; no live traffic data available.');
+      return buildNoDataResult('no-data-empty-here-response');
     }
 
     // Build "all segments" payload for debug overlay (pink layer).
@@ -611,80 +557,9 @@ const fetchHereTrafficData = async () => {
     };
     
   } catch (error) {
-    console.log('❌ HERE API failed, falling back to synthetic data:', error.response?.status, error.message);
-    return buildSyntheticFallback('synthetic-here-error');
+    console.log('❌ HERE API failed; no live traffic data available:', error.response?.status, error.message);
+    return buildNoDataResult('no-data-here-error');
   }
-};
-
-// Generate realistic synthetic traffic data
-const generateSyntheticTrafficData = () => {
-  const now = new Date();
-  const hour = now.getHours();
-  const dayOfWeek = now.getDay(); // 0 = Sunday
-  
-  console.log(`🤖 Generating synthetic traffic data for ${hour}:00 on day ${dayOfWeek}`);
-  
-  const trafficData = [];
-  
-  Object.keys(segmentData).forEach(segmentId => {
-    const segment = segmentData[segmentId];
-    const ratio = generateTimeBasedTrafficRatio(segment.type, segment.priority, hour, dayOfWeek);
-    
-    trafficData.push({
-      segmentId: segmentId,
-      ratio: ratio
-    });
-  });
-  
-  return trafficData;
-};
-
-// Generate time-based traffic ratios
-const generateTimeBasedTrafficRatio = (roadType, priority = 'medium', hour = null, dayOfWeek = null) => {
-  if (hour === null) hour = new Date().getHours();
-  if (dayOfWeek === null) dayOfWeek = new Date().getDay();
-  
-  let baseRatio = 1.0; // Free flow
-  
-  // Rush hour patterns
-  const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
-  const isMorningRush = hour >= 7 && hour <= 9;
-  const isEveningRush = hour >= 17 && hour <= 19;
-  const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-  
-  if (isWeekday) {
-    if (isMorningRush || isEveningRush) {
-      // Heavy congestion during rush hours
-      if (roadType === 'bridge') baseRatio = 0.3 + Math.random() * 0.2; // 30-50% of free flow
-      else if (roadType === 'highway') baseRatio = 0.4 + Math.random() * 0.2; // 40-60%
-      else if (roadType === 'arterial') baseRatio = 0.5 + Math.random() * 0.3; // 50-80%
-      else baseRatio = 0.7 + Math.random() * 0.2; // 70-90%
-    } else {
-      // Light to moderate congestion off-peak
-      if (roadType === 'bridge') baseRatio = 0.6 + Math.random() * 0.3; // 60-90%
-      else baseRatio = 0.8 + Math.random() * 0.2; // 80-100%
-    }
-  } else if (isWeekend) {
-    // Weekend patterns
-    if (hour >= 10 && hour <= 16) {
-      // Weekend afternoon activity
-      baseRatio = 0.7 + Math.random() * 0.2; // 70-90%
-    } else if (hour >= 17 && hour <= 21) {
-      // Sunday evening return traffic - heavy congestion
-      if (roadType === 'bridge') baseRatio = 0.2 + Math.random() * 0.2; // 20-40% (very heavy)
-      else if (roadType === 'highway') baseRatio = 0.3 + Math.random() * 0.2; // 30-50% (heavy)
-      else if (roadType === 'arterial') baseRatio = 0.4 + Math.random() * 0.3; // 40-70% (moderate-heavy)
-      else baseRatio = 0.6 + Math.random() * 0.2; // 60-80% (moderate)
-    } else {
-      baseRatio = 0.85 + Math.random() * 0.15; // 85-100%
-    }
-  }
-  
-  // Priority adjustments
-  if (priority === 'high') baseRatio *= 0.9; // High priority roads more congested
-  if (priority === 'low') baseRatio = Math.min(1.0, baseRatio * 1.1); // Low priority less congested
-  
-  return Math.max(0.1, Math.min(1.0, baseRatio));
 };
 
 // Lions Gate Bridge Counter-Flow Data Collection
@@ -811,6 +686,11 @@ const collectTrafficData = async () => {
     }
 
     updateDebugRouteSnapshotFromFetch(fetchResult, timestamp);
+
+    if (trafficData.length === 0) {
+      console.warn('⚠️ No live traffic data returned; skipping interval capture.');
+      return;
+    }
     
     // Convert to interval format
     const interval = {
@@ -866,44 +746,6 @@ app.get('/health', (req, res) => {
     intervals: trafficIntervals.length,
     collecting: isCollecting
   });
-});
-
-// Emergency database clearing endpoint (one-time use)
-app.post('/api/admin/clear-database', async (req, res) => {
-  try {
-    if (!db) {
-      return res.status(400).json({
-        error: 'Database not configured',
-        message: 'No DATABASE_URL environment variable found'
-      });
-    }
-    
-    console.log('🚨 ADMIN ACTION: Database clearing requested');
-    const result = await db.clearAllTrafficData();
-    
-    if (result.success) {
-      res.json({
-        success: true,
-        message: `Successfully cleared ${result.deletedRows} traffic snapshots`,
-        freedSpace: 'Database space freed up for optimized collection',
-        timestamp: new Date().toISOString()
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: result.error,
-        message: 'Failed to clear database'
-      });
-    }
-    
-  } catch (error) {
-    console.error('❌ Database clearing failed:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      message: 'Database clearing operation failed'
-    });
-  }
 });
 
 app.get('/api/traffic/today', async (req, res) => {
@@ -1028,14 +870,19 @@ app.get('/api/traffic/today', async (req, res) => {
       console.warn(`⚠️ Memory traffic data appears stale (${Math.round(memoryDataAgeMs / 1000)}s old).`);
     }
     
+    const memorySegments = trafficIntervals.length > 0 ? segmentData : {};
+    const memorySegmentCount = Object.keys(memorySegments).length;
+
     response = {
       intervals: trafficIntervals,
-      segments: segmentData,
-      totalSegments: Object.keys(segmentData).length,
+      segments: memorySegments,
+      totalSegments: memorySegmentCount,
       currentIntervalIndex: trafficIntervals.length - 1,
       maxInterval: trafficIntervals.length - 1,
-      coverage: `North Vancouver comprehensive: ${Object.keys(segmentData).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
-      dataSource: 'memory-ephemeral',
+      coverage: memorySegmentCount > 0
+        ? `North Vancouver comprehensive: ${memorySegmentCount} segments across ${NORTH_VAN_ROADS.length} major roads`
+        : 'No live traffic data available',
+      dataSource: trafficIntervals.length > 0 ? 'memory-ephemeral' : 'no-live-data',
       counterFlow: {
         status: counterFlowData.currentStatus,
         lanesOutbound: counterFlowData.lanesOutbound || 1,
@@ -1171,15 +1018,24 @@ app.get('/api/database/stats', async (req, res) => {
 app.get('/api/counterflow/status', async (req, res) => {
   try {
     const now = Date.now();
+    const hasCounterflowStatus =
+      typeof counterFlowData.currentStatus === 'string' && counterFlowData.currentStatus.length > 0;
+    const stateStartTime = counterFlowData.statusSince
+      ? new Date(counterFlowData.statusSince).getTime()
+      : null;
     const response = {
-      isActive: counterFlowData.currentStatus === 'outbound-2', // 2 lanes outbound = counterflow
+      hasData: hasCounterflowStatus,
+      isActive: hasCounterflowStatus ? counterFlowData.currentStatus === 'outbound-2' : null, // 2 lanes outbound = counterflow
       status: counterFlowData.currentStatus,
-      lanesOutbound: counterFlowData.lanesOutbound || 1,
-      stateStartTime: counterFlowData.statusSince ? new Date(counterFlowData.statusSince).getTime() : now,
-      currentDuration: counterFlowData.statusSince ? now - new Date(counterFlowData.statusSince).getTime() : 0,
+      lanesOutbound: hasCounterflowStatus ? (counterFlowData.lanesOutbound || 1) : null,
+      stateStartTime,
+      currentDuration: stateStartTime ? now - stateStartTime : null,
       lastChecked: counterFlowData.lastChecked ? new Date(counterFlowData.lastChecked).getTime() : null,
       lastUpdated: counterFlowData.lastChecked ? new Date(counterFlowData.lastChecked).getTime() : null,
-      isHealthy: counterFlowData.lastChecked && (now - new Date(counterFlowData.lastChecked).getTime()) < 5 * 60 * 1000, // healthy if checked within 5 minutes
+      isHealthy: !!(
+        counterFlowData.lastChecked &&
+        (now - new Date(counterFlowData.lastChecked).getTime()) < 5 * 60 * 1000
+      ), // healthy if checked within 5 minutes
       rawStatus: counterFlowData.currentStatus
     };
     
@@ -1213,9 +1069,6 @@ app.get('/api/counterflow/history', async (req, res) => {
 const startServer = async () => {
   console.log('🚀 Starting North Vancouver Traffic Server (HERE API)...');
   
-  // Initialize road segments
-  initializeSegments();
-  
   // Start data collection
   isCollecting = true;
   await collectTrafficData();
@@ -1230,7 +1083,7 @@ const startServer = async () => {
   app.listen(PORT, () => {
     console.log(`🌐 Server running on port ${PORT}`);
     console.log(`📍 Monitoring ${NORTH_VAN_ROADS.length} major roads with ${Object.keys(segmentData).length} segments`);
-    console.log(`🔑 HERE API: ${HERE_API_KEY !== 'YOUR_HERE_API_KEY_NEEDED' ? 'Configured' : 'Using synthetic data'}`);
+    console.log(`🔑 HERE API: ${HERE_API_KEY !== 'YOUR_HERE_API_KEY_NEEDED' ? 'Configured' : 'Not configured'}`);
   });
 };
 
