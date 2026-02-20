@@ -292,6 +292,64 @@ const getLatestIntervalTimestampMs = (intervals) => {
   return null;
 };
 
+const getLatestTimestampedInterval = (intervals) => {
+  if (!Array.isArray(intervals) || intervals.length === 0) return null;
+  for (let i = intervals.length - 1; i >= 0; i -= 1) {
+    const interval = intervals[i];
+    if (Number.isFinite(parseIntervalTimestampMs(interval))) {
+      return interval;
+    }
+  }
+  return null;
+};
+
+const getIntervalDataKeys = (interval) => {
+  if (!interval || typeof interval !== 'object') return new Set();
+  return new Set(
+    Object.keys(interval).filter((key) => key !== 'timestamp')
+  );
+};
+
+const areIntervalSchemasCompatible = (leftInterval, rightInterval, minOverlapRatio = 0.65) => {
+  const leftKeys = getIntervalDataKeys(leftInterval);
+  const rightKeys = getIntervalDataKeys(rightInterval);
+
+  if (leftKeys.size === 0 || rightKeys.size === 0) {
+    return false;
+  }
+
+  let overlapCount = 0;
+  leftKeys.forEach((key) => {
+    if (rightKeys.has(key)) overlapCount += 1;
+  });
+
+  const overlapRatio = overlapCount / Math.min(leftKeys.size, rightKeys.size);
+  return overlapRatio >= minOverlapRatio;
+};
+
+const mergeIntervalsByTimestamp = (primaryIntervals, secondaryIntervals) => {
+  const mergedByTimestamp = new Map();
+
+  const pushInterval = (interval) => {
+    const parsedMs = parseIntervalTimestampMs(interval);
+    if (!Number.isFinite(parsedMs)) return;
+    const dedupeKey = String(parsedMs);
+    mergedByTimestamp.set(dedupeKey, interval);
+  };
+
+  // Primary first, then secondary overrides overlapping timestamps.
+  if (Array.isArray(primaryIntervals)) {
+    primaryIntervals.forEach(pushInterval);
+  }
+  if (Array.isArray(secondaryIntervals)) {
+    secondaryIntervals.forEach(pushInterval);
+  }
+
+  return Array.from(mergedByTimestamp.entries())
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([, interval]) => interval);
+};
+
 const buildTrackedDebugSegments = () => {
   const trackedSegments = {};
   Object.entries(segmentData).forEach(([segmentId, segment]) => {
@@ -856,6 +914,10 @@ app.get('/api/traffic/today', async (req, res) => {
     if (db) {
       console.log(`📊 API Request: /api/traffic/today - checking database...`);
       try {
+        const latestMemoryIntervalMs = getLatestIntervalTimestampMs(trafficIntervals);
+        const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
+          ? Math.max(0, Date.now() - latestMemoryIntervalMs)
+          : null;
         const dbData = await db.getTodayTrafficData();
         console.log(`🔍 DB data received: intervals=${dbData?.intervals?.length || 0}, segments=${Object.keys(dbData?.segments || {}).length}`);
         
@@ -865,11 +927,55 @@ app.get('/api/traffic/today', async (req, res) => {
             ? Math.max(0, Date.now() - latestDbIntervalMs)
             : Number.POSITIVE_INFINITY;
           const isDbFreshEnough = dbDataAgeMs <= TRAFFIC_DB_STALE_MAX_AGE_MS;
+          const latestDbInterval = getLatestTimestampedInterval(dbData.intervals);
+          const latestMemoryInterval = getLatestTimestampedInterval(trafficIntervals);
+          const canMergeDbAndMemory = areIntervalSchemasCompatible(latestDbInterval, latestMemoryInterval);
 
           if (!isDbFreshEnough) {
             console.warn(
-              `⚠️ DB data is stale (age ${Math.round(dbDataAgeMs / 1000)}s, threshold ${Math.round(TRAFFIC_DB_STALE_MAX_AGE_MS / 1000)}s). Falling back to memory.`
+              `⚠️ DB data is stale (age ${Math.round(dbDataAgeMs / 1000)}s, threshold ${Math.round(TRAFFIC_DB_STALE_MAX_AGE_MS / 1000)}s). Serving hybrid DB+memory response.`
             );
+            if (!canMergeDbAndMemory) {
+              console.warn('⚠️ DB and memory interval schemas appear different; merging by timestamp with unioned segment metadata.');
+            }
+            const mergedIntervals = mergeIntervalsByTimestamp(dbData.intervals, trafficIntervals);
+            const mergedLatestMs = getLatestIntervalTimestampMs(mergedIntervals);
+            const mergedAgeMs = Number.isFinite(mergedLatestMs)
+              ? Math.max(0, Date.now() - mergedLatestMs)
+              : null;
+            const mergedSegments = {
+              ...(dbData.segments || {}),
+              ...(segmentData || {})
+            };
+            const mergedSegmentCount = Object.keys(mergedSegments).length;
+            response = {
+              intervals: mergedIntervals,
+              segments: mergedSegments,
+              totalSegments: mergedSegmentCount,
+              currentIntervalIndex: mergedIntervals.length - 1,
+              maxInterval: mergedIntervals.length - 1,
+              coverage: `North Vancouver comprehensive: ${mergedSegmentCount} segments across ${NORTH_VAN_ROADS.length} major roads`,
+              dataSource: canMergeDbAndMemory ? 'hybrid-db-memory' : 'hybrid-db-memory-incompatible',
+              counterFlow: {
+                status: counterFlowData.currentStatus ?? dbData.counterFlow?.currentStatus,
+                lanesOutbound: counterFlowData.lanesOutbound || dbData.counterFlow?.lanesOutbound || 1,
+                statusSince: counterFlowData.statusSince || dbData.counterFlow?.statusSince,
+                lastChecked: counterFlowData.lastChecked || dbData.counterFlow?.lastChecked,
+                durationMs: (counterFlowData.statusSince || dbData.counterFlow?.statusSince)
+                  ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
+                  : null
+              },
+              fromDatabase: true,
+              fromMemory: true,
+              schemaCompatible: canMergeDbAndMemory,
+              dbRecordCount: dbData.recordCount,
+              latestIntervalAgeMs: mergedAgeMs,
+              dbLatestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
+              memoryLatestIntervalAgeMs: memoryDataAgeMs
+            };
+            console.log(`✅ Served hybrid dataset: ${mergedIntervals.length} merged intervals (DB stale, memory tail appended)`);
+            res.json(response);
+            return;
           } else {
             response = {
               intervals: dbData.intervals,
@@ -889,7 +995,8 @@ app.get('/api/traffic/today', async (req, res) => {
               },
               fromDatabase: true,
               dbRecordCount: dbData.recordCount,
-              latestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null
+              latestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
+              memoryLatestIntervalAgeMs: memoryDataAgeMs
             };
             console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
             res.json(response);
@@ -916,6 +1023,7 @@ app.get('/api/traffic/today', async (req, res) => {
     const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
       ? Math.max(0, Date.now() - latestMemoryIntervalMs)
       : null;
+    
     if (memoryDataAgeMs !== null && memoryDataAgeMs > TRAFFIC_DB_STALE_MAX_AGE_MS) {
       console.warn(`⚠️ Memory traffic data appears stale (${Math.round(memoryDataAgeMs / 1000)}s old).`);
     }

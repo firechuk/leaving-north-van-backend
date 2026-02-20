@@ -229,14 +229,18 @@ class TrafficDatabase {
             
             // Reconstruct data from database
             const intervals = [];
-            let segments = {};
+            const segments = {};
             let counterFlow = {};
             
             result.rows.forEach((row, index) => {
                 try {
                     const snapshot = JSON.parse(row.raw_data);
                     intervals.push(snapshot.intervalData);
-                    segments = snapshot.segmentData; // Same for all intervals
+                    if (snapshot.segmentData && typeof snapshot.segmentData === 'object') {
+                        // Keep a union of segment metadata so historical intervals still resolve
+                        // even when segment keys change between snapshots.
+                        Object.assign(segments, snapshot.segmentData);
+                    }
                     counterFlow = snapshot.counterFlowData; // Latest state
                 } catch (parseError) {
                     console.error(`❌ JSON parse error for row ${index} (id: ${row.id || 'unknown'}):`, parseError.message);
