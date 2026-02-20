@@ -25,6 +25,20 @@ const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 const TRAFFIC_DB_STALE_MAX_AGE_MS = 12 * 60 * 1000;
 const MIN_FILTERED_SEGMENTS_FOR_TRACKED = 12;
+const BRIDGE_CORRIDORS = {
+  lionsGate: {
+    minLng: -123.152,
+    maxLng: -123.115,
+    minLat: 49.296,
+    maxLat: 49.323
+  },
+  ironworkers: {
+    minLng: -123.055,
+    maxLng: -123.0,
+    minLat: 49.274,
+    maxLat: 49.305
+  }
+};
 
 // OPTIMIZED: Tier 1 + Tier 2 critical monitoring roads only
 // Reduced from 21 roads (282 segments) to 15 roads (~45 segments) to solve database crisis
@@ -184,6 +198,104 @@ const buildStableHereSegmentId = (segment, coordinates) => {
   return `here-net-${digest}`;
 };
 
+const inferSegmentType = (description = '') => {
+  const text = String(description || '').trim().toLowerCase();
+  if (!text) return 'road';
+
+  if (
+    text.includes('lions gate') ||
+    text.includes('lions-gate') ||
+    text.includes('lionsgate') ||
+    text.includes('ironworkers') ||
+    text.includes('iron workers') ||
+    text.includes('second narrows') ||
+    text.includes('memorial bridge') ||
+    text.includes('bridge')
+  ) {
+    return 'bridge';
+  }
+
+  if (
+    text.includes('hwy1') ||
+    text.includes('hwy 1') ||
+    text.includes('highway 1') ||
+    text.includes('trans-canada') ||
+    text.includes('upper levels')
+  ) {
+    return 'highway';
+  }
+
+  if (
+    text.includes('onramp') ||
+    text.includes('offramp') ||
+    text.includes('off-ramp') ||
+    text.includes('on-ramp') ||
+    text.includes('interchange') ||
+    text.includes('ramp')
+  ) {
+    return 'ramp';
+  }
+
+  if (
+    text.includes('avenue') ||
+    text.includes(' ave ') ||
+    text.endsWith(' ave') ||
+    text.includes(' street') ||
+    text.endsWith(' st') ||
+    text.includes(' road') ||
+    text.includes(' drive') ||
+    text.includes(' boulevard') ||
+    text.includes(' blvd') ||
+    text.includes(' corridor')
+  ) {
+    return 'arterial';
+  }
+
+  return 'road';
+};
+
+const touchesBridgeCorridor = (coordinates, corridor) => {
+  if (!Array.isArray(coordinates) || !corridor) return false;
+  return coordinates.some((coord) => {
+    if (!Array.isArray(coord) || coord.length < 2) return false;
+    const [lng, lat] = coord;
+    return Number.isFinite(lng) &&
+      Number.isFinite(lat) &&
+      lng >= corridor.minLng &&
+      lng <= corridor.maxLng &&
+      lat >= corridor.minLat &&
+      lat <= corridor.maxLat;
+  });
+};
+
+const inferBridgeHint = (description = '', coordinates = []) => {
+  const text = String(description || '').trim().toLowerCase();
+  if (
+    text.includes('lions gate') ||
+    text.includes('lions-gate') ||
+    text.includes('lionsgate')
+  ) {
+    return 'lions-gate';
+  }
+  if (
+    text.includes('ironworkers') ||
+    text.includes('iron workers') ||
+    text.includes('second narrows') ||
+    text.includes('memorial bridge')
+  ) {
+    return 'ironworkers';
+  }
+
+  if (touchesBridgeCorridor(coordinates, BRIDGE_CORRIDORS.lionsGate)) {
+    return 'lions-gate';
+  }
+  if (touchesBridgeCorridor(coordinates, BRIDGE_CORRIDORS.ironworkers)) {
+    return 'ironworkers';
+  }
+
+  return null;
+};
+
 const buildHereSegmentRecord = (segment, index) => {
   const coordinates = extractCoordinatesFromHereSegment(segment);
   if (coordinates.length < 2) return null;
@@ -198,13 +310,16 @@ const buildHereSegmentRecord = (segment, index) => {
   const hereReference = extractHereReference(segment);
   const sourceId = buildStableHereSegmentId(segment, coordinates);
   const numericIds = extractNumericTokens(sourceId, hereReference, description);
+  const bridgeHint = inferBridgeHint(description, coordinates);
+  const type = inferSegmentType(description);
 
   return {
     sourceId,
     name: description || `Traffic Segment ${index + 1}`,
     description: description || null,
     coordinates,
-    type: 'road',
+    type,
+    bridgeHint,
     hereReference,
     numericIds,
     currentSpeed,
@@ -229,6 +344,7 @@ const buildFallbackAllSegmentsFromTracked = (segments = {}) => {
       description: segment?.description || segment?.name || segmentId,
       coordinates,
       type: segment?.type || 'road',
+      bridgeHint: segment?.bridgeHint || null,
       hereReference: segment?.hereReference || null,
       numericIds: extractNumericTokens(sourceId, segment?.name, segment?.hereReference),
       currentSpeed: null,
@@ -508,7 +624,8 @@ const fetchHereTrafficData = async () => {
       const currentSpeed = record.currentSpeed !== null ? record.currentSpeed : 50;
       const freeFlowSpeed = record.freeFlowSpeed !== null ? record.freeFlowSpeed : currentSpeed || 50;
       const flowRatio = freeFlowSpeed > 0 ? Math.min(1.0, currentSpeed / freeFlowSpeed) : 1.0;
-      const segmentId = `here-0-${index}`;
+      const segmentId = record.sourceId;
+      if (typeof segmentId !== 'string' || segmentId.length === 0) return;
       
       trafficData.push({
         segmentId,
@@ -521,10 +638,13 @@ const fetchHereTrafficData = async () => {
       
       if (record.coordinates.length >= 2) {
         segmentMetadata[segmentId] = {
+          id: segmentId,
+          segmentId,
           name: record.name,
           description: record.description,
           coordinates: record.coordinates,
           type: record.type,
+          bridgeHint: record.bridgeHint,
           sourceId: record.sourceId,
           hereReference: record.hereReference,
           numericIds: record.numericIds
@@ -716,10 +836,17 @@ const collectTrafficData = async () => {
         Object.keys(segmentMetadata).forEach((segmentId) => {
           const segment = segmentMetadata[segmentId];
           cleanSegmentData[segmentId] = {
+            id: segment.id || segmentId,
+            segmentId: segment.segmentId || segmentId,
             name: segment.name,
+            description: segment.description || null,
             coordinates: segment.coordinates,
-            type: segment.type
-            // Skip originalData - contains circular references from HERE API
+            type: segment.type,
+            bridgeHint: segment.bridgeHint || null,
+            sourceId: segment.sourceId || segmentId,
+            hereReference: segment.hereReference || null,
+            numericIds: Array.isArray(segment.numericIds) ? segment.numericIds : []
+            // Skip originalData - contains large HERE payloads
           };
         });
         
