@@ -134,6 +134,25 @@ function getServiceIntervalIndex(date = new Date()) {
     return Math.floor(minutesSinceStart / SNAPSHOT_INTERVAL_MINUTES);
 }
 
+function normalizeObservedAtTimestamp(observedAt) {
+    if (observedAt instanceof Date) {
+        return Number.isNaN(observedAt.getTime()) ? null : observedAt.toISOString();
+    }
+
+    if (typeof observedAt === 'number' && Number.isFinite(observedAt)) {
+        const parsed = new Date(observedAt);
+        return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    }
+
+    if (typeof observedAt !== 'string') return null;
+    const trimmed = observedAt.trim();
+    if (!trimmed) return null;
+
+    const parsedMs = Date.parse(trimmed);
+    if (!Number.isFinite(parsedMs)) return null;
+    return new Date(parsedMs).toISOString();
+}
+
 class TrafficDatabase {
     constructor() {
         this.pool = new Pool({
@@ -236,11 +255,26 @@ class TrafficDatabase {
             const intervals = [];
             const segments = {};
             let counterFlow = {};
+            let rewrittenTimestampCount = 0;
             
             result.rows.forEach((row, index) => {
                 try {
                     const snapshot = JSON.parse(row.raw_data);
-                    intervals.push(snapshot.intervalData);
+                    const intervalData = snapshot.intervalData && typeof snapshot.intervalData === 'object'
+                        ? { ...snapshot.intervalData }
+                        : null;
+
+                    if (intervalData) {
+                        // Use DB observed_at as canonical interval time. This avoids timeline gaps
+                        // when historical raw_data timestamps were saved in mixed formats.
+                        const observedAtIso = normalizeObservedAtTimestamp(row.observed_at);
+                        if (observedAtIso && intervalData.timestamp !== observedAtIso) {
+                            intervalData.timestamp = observedAtIso;
+                            rewrittenTimestampCount += 1;
+                        }
+                        intervals.push(intervalData);
+                    }
+
                     if (snapshot.segmentData && typeof snapshot.segmentData === 'object') {
                         // Keep a union of segment metadata so historical intervals still resolve
                         // even when segment keys change between snapshots.
@@ -254,7 +288,11 @@ class TrafficDatabase {
                 }
             });
             
-            console.log(`✅ DB read success: Reconstructed ${intervals.length} intervals, ${Object.keys(segments).length} segments from ${result.rows.length} total rows`);
+            console.log(
+                `✅ DB read success: Reconstructed ${intervals.length} intervals, ` +
+                `${Object.keys(segments).length} segments from ${result.rows.length} total rows ` +
+                `(${rewrittenTimestampCount} interval timestamps normalized from observed_at)`
+            );
             
             // Return data even if some records were corrupted (better than complete failure)
             return {
