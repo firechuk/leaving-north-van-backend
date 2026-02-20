@@ -153,6 +153,25 @@ function normalizeObservedAtTimestamp(observedAt) {
     return new Date(parsedMs).toISOString();
 }
 
+function getIndexedColumnsFromDefinition(definition) {
+    if (typeof definition !== 'string') return [];
+    const match = definition.match(/\(([^)]+)\)/);
+    if (!match) return [];
+    return match[1]
+        .split(',')
+        .map((part) => part.trim().replace(/"/g, '').toLowerCase())
+        .filter(Boolean);
+}
+
+function isLegacyIntervalIndexOnlyDefinition(definition) {
+    const columns = getIndexedColumnsFromDefinition(definition);
+    return columns.length === 1 && columns[0] === 'interval_index';
+}
+
+function quoteIdentifier(identifier) {
+    return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
 class TrafficDatabase {
     constructor() {
         this.pool = new Pool({
@@ -160,21 +179,87 @@ class TrafficDatabase {
             ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
         });
         
-        this.initDatabase();
+        this.readyPromise = this.initDatabase();
     }
     
     async initDatabase() {
         try {
-            // Create table if it doesn't exist (Railway creates manually via UI)
             console.log('✅ Database connection established');
+            await this.ensureTrafficSnapshotsConstraints();
         } catch (error) {
             console.error('❌ Database initialization failed:', error);
+        }
+    }
+
+    async ensureTrafficSnapshotsConstraints() {
+        const client = await this.pool.connect();
+        const droppedLegacyConstraints = [];
+        const droppedLegacyIndexes = [];
+
+        try {
+            await client.query('BEGIN');
+
+            const uniqueConstraintsResult = await client.query(`
+                SELECT conname, pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conrelid = 'traffic_snapshots'::regclass
+                  AND contype = 'u';
+            `);
+
+            for (const row of uniqueConstraintsResult.rows) {
+                if (!isLegacyIntervalIndexOnlyDefinition(row.definition)) continue;
+                await client.query(`ALTER TABLE traffic_snapshots DROP CONSTRAINT IF EXISTS ${quoteIdentifier(row.conname)};`);
+                droppedLegacyConstraints.push(row.conname);
+            }
+
+            await client.query(`
+                ALTER TABLE traffic_snapshots
+                ADD CONSTRAINT traffic_snapshots_date_key_interval_index_key
+                UNIQUE (date_key, interval_index);
+            `).catch((error) => {
+                if (error && error.code === '42710') return; // duplicate_object
+                throw error;
+            });
+
+            const uniqueIndexesResult = await client.query(`
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND tablename = 'traffic_snapshots';
+            `);
+
+            for (const row of uniqueIndexesResult.rows) {
+                const indexDef = String(row.indexdef || '');
+                if (!/create\s+unique\s+index/i.test(indexDef)) continue;
+                if (!isLegacyIntervalIndexOnlyDefinition(indexDef)) continue;
+                await client.query(`DROP INDEX IF EXISTS ${quoteIdentifier(row.indexname)};`);
+                droppedLegacyIndexes.push(row.indexname);
+            }
+
+            await client.query('COMMIT');
+            console.log(
+                `✅ DB constraint check complete: ` +
+                `dropped legacy constraints=${droppedLegacyConstraints.length}, ` +
+                `dropped legacy indexes=${droppedLegacyIndexes.length}`
+            );
+        } catch (error) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (rollbackError) {
+                console.error('❌ Failed to rollback DB constraint migration:', rollbackError.message);
+            }
+            throw error;
+        } finally {
+            client.release();
         }
     }
     
     // Save complete traffic snapshot (replaces in-memory storage)
     async saveTrafficSnapshot(intervalData, segmentData, counterFlowData) {
         try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
             const now = new Date();
             const dateKey = getServiceDayKey(now);
             const intervalIndex = this.calculateIntervalIndex(now);
@@ -189,6 +274,10 @@ class TrafficDatabase {
             const query = `
                 INSERT INTO traffic_snapshots (observed_at, date_key, interval_index, raw_data)
                 VALUES ($1, $2, $3, $4)
+                ON CONFLICT (date_key, interval_index)
+                DO UPDATE SET
+                    observed_at = EXCLUDED.observed_at,
+                    raw_data = EXCLUDED.raw_data
                 RETURNING id;
             `;
             
@@ -200,7 +289,7 @@ class TrafficDatabase {
             ];
             
             const result = await this.pool.query(query, values);
-            console.log(`✅ Saved traffic snapshot ${dateKey}-${intervalIndex} (id: ${result.rows[0].id})`);
+            console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${result.rows[0].id})`);
             return result.rows[0].id;
         } catch (error) {
             console.error('❌ Failed to save traffic snapshot:', error.message);
@@ -212,6 +301,9 @@ class TrafficDatabase {
     // Get traffic data for current + previous service days.
     async getTodayTrafficData(serviceDays = 2) {
         try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
             const normalizedServiceDays = Math.max(1, Math.min(7, Number(serviceDays) || 1));
             const { serviceDayKey, startUtc, endUtc } = getCurrentServiceDayWindow(new Date());
             const windowStartUtc = new Date(startUtc.getTime() - ((normalizedServiceDays - 1) * 24 * 60 * 60 * 1000));
@@ -319,6 +411,9 @@ class TrafficDatabase {
     // Get database statistics
     async getStats() {
         try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
             const query = `
                 SELECT 
                     date_key,
@@ -342,6 +437,9 @@ class TrafficDatabase {
     // Clear all traffic data (emergency database cleanup)
     async clearAllTrafficData() {
         try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
             console.log('🗑️  Clearing all traffic data from database...');
             
             const query = `DELETE FROM traffic_snapshots;`;
