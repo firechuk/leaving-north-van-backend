@@ -23,6 +23,19 @@ const HERE_API_KEY = process.env.HERE_API_KEY || 'YOUR_HERE_API_KEY_NEEDED';
 const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
+const MANUAL_TRACKED_SOURCE_IDS = new Set([
+  'here-net-0dcfe4832adf37',
+  'here-net-b9879cd7423d5d',
+  'here-net-cbb01b6ccf8c63',
+  'here-net-e47c5902d3946c',
+  'here-net-217f7880e97341',
+  'here-net-383887eeb1c4b2',
+  'here-net-ad611c65317425',
+  'here-net-067035bd6cc5d7',
+  'here-net-3a171ea8d95b6f',
+  'here-net-1f008d0747be84',
+  'here-net-fdc3c855f1a803'
+]);
 const TRAFFIC_DB_STALE_MAX_AGE_MS = 12 * 60 * 1000;
 const MIN_FILTERED_SEGMENTS_FOR_TRACKED = 12;
 const BRIDGE_CORRIDORS = {
@@ -108,7 +121,11 @@ let debugRouteSnapshot = {
   allSegments: {},
   trackedSourceIds: [],
   rawSegmentCount: 0,
-  filteredSegmentCount: 0
+  filteredSegmentCount: 0,
+  selectedSegmentCount: 0,
+  filterMode: 'none',
+  manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+  manualTrackedMatchedCount: 0
 };
 
 const toFiniteNumber = (value) => {
@@ -371,7 +388,11 @@ const updateDebugRouteSnapshotFromFetch = (fetchResult, fetchedAt = new Date().t
     allSegments,
     trackedSourceIds: [...new Set(trackedSourceIds)],
     rawSegmentCount: fetchResult?.debugMeta?.rawSegmentCount || Object.keys(allSegments).length,
-    filteredSegmentCount: fetchResult?.debugMeta?.filteredSegmentCount || 0
+    filteredSegmentCount: fetchResult?.debugMeta?.filteredSegmentCount || 0,
+    selectedSegmentCount: fetchResult?.debugMeta?.selectedSegmentCount || 0,
+    filterMode: fetchResult?.debugMeta?.filterMode || 'none',
+    manualTrackedConfiguredCount: fetchResult?.debugMeta?.manualTrackedConfiguredCount || MANUAL_TRACKED_SOURCE_IDS.size,
+    manualTrackedMatchedCount: fetchResult?.debugMeta?.manualTrackedMatchedCount || 0
   };
 };
 
@@ -500,6 +521,8 @@ const fetchHereTrafficData = async () => {
         allSegmentCount: 0,
         filteredSegmentCount: 0,
         selectedSegmentCount: 0,
+        manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+        manualTrackedMatchedCount: 0,
         filterMode: 'none',
         trackedSourceIds: []
       }
@@ -533,9 +556,11 @@ const fetchHereTrafficData = async () => {
 
     // Build "all segments" payload for debug overlay (pink layer).
     const allSegmentMetadata = {};
+    const segmentRecords = new Map();
     rawSegments.forEach((segment, index) => {
       const record = buildHereSegmentRecord(segment, index);
       if (!record) return;
+      segmentRecords.set(segment, record);
 
       allSegmentMetadata[record.sourceId] = {
         id: record.sourceId,
@@ -567,10 +592,23 @@ const fetchHereTrafficData = async () => {
       });
     };
     
-    // Filter segments to only critical roads first.
-    const filteredSegments = rawSegments.filter(isSegmentInCriticalRoads);
+    const isSegmentManuallyTracked = (segment) => {
+      const record = segmentRecords.get(segment);
+      if (!record || typeof record.sourceId !== 'string') return false;
+      return MANUAL_TRACKED_SOURCE_IDS.has(record.sourceId);
+    };
+
+    // Track segments from critical road filters plus explicit manual picks.
+    const criticalSegments = rawSegments.filter(isSegmentInCriticalRoads);
+    const manuallyTrackedSegments = rawSegments.filter(isSegmentManuallyTracked);
+    const filteredSegmentSet = new Set(criticalSegments);
+    manuallyTrackedSegments.forEach((segment) => filteredSegmentSet.add(segment));
+    const filteredSegments = [...filteredSegmentSet];
+
     let selectedSegments = filteredSegments;
-    let filterMode = 'critical-only';
+    let filterMode = manuallyTrackedSegments.length > 0
+      ? 'critical-plus-manual'
+      : 'critical-only';
     if (filteredSegments.length < MIN_FILTERED_SEGMENTS_FOR_TRACKED) {
       filterMode = 'raw-fallback';
       selectedSegments = rawSegments;
@@ -578,13 +616,16 @@ const fetchHereTrafficData = async () => {
         `⚠️ Filtered segment count too low (${filteredSegments.length}). Falling back to all ${rawSegments.length} HERE segments.`
       );
     }
-    console.log(`🎯 Filtered ${rawSegments.length} segments to ${filteredSegments.length} critical road segments (serving ${selectedSegments.length}, mode=${filterMode})`);
+    if (manuallyTrackedSegments.length > 0) {
+      console.log(`🧭 Manual tracked source IDs matched: ${manuallyTrackedSegments.length}/${MANUAL_TRACKED_SOURCE_IDS.size}`);
+    }
+    console.log(`🎯 Filtered ${rawSegments.length} segments to ${filteredSegments.length} tracked candidates (serving ${selectedSegments.length}, mode=${filterMode})`);
     
     // DEBUG: Log a few kept/rejected segments for troubleshooting.
     const kept = selectedSegments;
     const rejected = filterMode === 'raw-fallback'
       ? []
-      : rawSegments.filter(seg => !isSegmentInCriticalRoads(seg));
+      : rawSegments.filter(seg => !filteredSegmentSet.has(seg));
     
     console.log('🔍 DEBUG - Sample segments KEPT:');
     kept.slice(0, 3).forEach((seg, i) => {
@@ -609,7 +650,7 @@ const fetchHereTrafficData = async () => {
       const coords = seg.location?.shape?.links?.[0]?.points?.[0];
       const inTrackedSet = filterMode === 'raw-fallback'
         ? 'KEPT'
-        : (isSegmentInCriticalRoads(seg) ? 'KEPT' : 'REJECTED');
+        : (filteredSegmentSet.has(seg) ? 'KEPT' : 'REJECTED');
       console.log(`  ${i + 1}. ${inTrackedSet}: ${seg.location?.description} at ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)}`);
     });
     
@@ -618,7 +659,7 @@ const fetchHereTrafficData = async () => {
     const segmentMetadata = {};
     
     selectedSegments.forEach((segment, index) => {
-      const record = buildHereSegmentRecord(segment, index);
+      const record = segmentRecords.get(segment) || buildHereSegmentRecord(segment, index);
       if (!record) return;
 
       const currentSpeed = record.currentSpeed !== null ? record.currentSpeed : 50;
@@ -671,6 +712,8 @@ const fetchHereTrafficData = async () => {
         allSegmentCount: Object.keys(allSegmentMetadata).length,
         filteredSegmentCount: filteredSegments.length,
         selectedSegmentCount: selectedSegments.length,
+        manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+        manualTrackedMatchedCount: manuallyTrackedSegments.length,
         filterMode,
         trackedSourceIds
       }
@@ -1059,7 +1102,11 @@ app.get('/api/debug/routes', async (req, res) => {
           allSegments: fallbackAllSegments,
           trackedSourceIds: Object.keys(fallbackAllSegments),
           rawSegmentCount: Object.keys(fallbackAllSegments).length,
-          filteredSegmentCount: Object.keys(segmentData).length
+          filteredSegmentCount: Object.keys(segmentData).length,
+          selectedSegmentCount: Object.keys(segmentData).length,
+          filterMode: 'tracked-fallback',
+          manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+          manualTrackedMatchedCount: 0
         };
       }
     }
@@ -1103,6 +1150,10 @@ app.get('/api/debug/routes', async (req, res) => {
         overlapSegments,
         rawSegmentCount: debugRouteSnapshot.rawSegmentCount,
         filteredSegmentCount: debugRouteSnapshot.filteredSegmentCount,
+        selectedSegmentCount: debugRouteSnapshot.selectedSegmentCount,
+        filterMode: debugRouteSnapshot.filterMode,
+        manualTrackedConfiguredCount: debugRouteSnapshot.manualTrackedConfiguredCount,
+        manualTrackedMatchedCount: debugRouteSnapshot.manualTrackedMatchedCount,
         cacheAgeMs
       },
       allSegments,
