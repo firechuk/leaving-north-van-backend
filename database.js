@@ -1,6 +1,139 @@
 // PostgreSQL integration for traffic data persistence
 const { Pool } = require('pg');
 
+const SERVICE_TIME_ZONE = 'America/Vancouver';
+const SERVICE_DAY_START_HOUR = 4;
+const SNAPSHOT_INTERVAL_MINUTES = 2;
+
+const serviceTimePartsFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: SERVICE_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    hourCycle: 'h23'
+});
+
+function getTimeZoneOffsetMs(date, timeZone) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return 0;
+
+    const dtf = new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+        hourCycle: 'h23'
+    });
+
+    const parts = dtf.formatToParts(date);
+    const values = {};
+    parts.forEach((part) => {
+        if (part.type !== 'literal') {
+            values[part.type] = part.value;
+        }
+    });
+
+    const asUTC = Date.UTC(
+        Number(values.year),
+        Number(values.month) - 1,
+        Number(values.day),
+        Number(values.hour),
+        Number(values.minute),
+        Number(values.second)
+    );
+
+    return asUTC - date.getTime();
+}
+
+function getDatePartsInServiceTimeZone(date) {
+    const parts = serviceTimePartsFormatter.formatToParts(date);
+    const values = {};
+    parts.forEach((part) => {
+        if (part.type !== 'literal') {
+            values[part.type] = part.value;
+        }
+    });
+
+    const parsedHour = Number(values.hour);
+    return {
+        year: Number(values.year),
+        month: Number(values.month),
+        day: Number(values.day),
+        hour: Number.isFinite(parsedHour) ? parsedHour % 24 : 0,
+        minute: Number(values.minute)
+    };
+}
+
+function formatDayKeyFromParts(year, month, day) {
+    return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function getUtcForTimeZoneDateTime(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0, timeZone = SERVICE_TIME_ZONE) {
+    let utcMs = Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
+    for (let i = 0; i < 3; i++) {
+        const offset = getTimeZoneOffsetMs(new Date(utcMs), timeZone);
+        const nextUtc = Date.UTC(year, month - 1, day, hour, minute, second, millisecond) - offset;
+        if (Math.abs(nextUtc - utcMs) < 1000) {
+            utcMs = nextUtc;
+            break;
+        }
+        utcMs = nextUtc;
+    }
+    return new Date(utcMs);
+}
+
+function getServiceDayKey(date = new Date()) {
+    const shifted = new Date(date.getTime() - (SERVICE_DAY_START_HOUR * 60 * 60 * 1000));
+    const parts = getDatePartsInServiceTimeZone(shifted);
+    return formatDayKeyFromParts(parts.year, parts.month, parts.day);
+}
+
+function getCurrentServiceDayWindow(now = new Date()) {
+    const currentParts = getDatePartsInServiceTimeZone(now);
+    const serviceDayStartDate = new Date(Date.UTC(currentParts.year, currentParts.month - 1, currentParts.day));
+    if (currentParts.hour < SERVICE_DAY_START_HOUR) {
+        serviceDayStartDate.setUTCDate(serviceDayStartDate.getUTCDate() - 1);
+    }
+
+    const serviceDayKey = formatDayKeyFromParts(
+        serviceDayStartDate.getUTCFullYear(),
+        serviceDayStartDate.getUTCMonth() + 1,
+        serviceDayStartDate.getUTCDate()
+    );
+
+    const startUtc = getUtcForTimeZoneDateTime(
+        serviceDayStartDate.getUTCFullYear(),
+        serviceDayStartDate.getUTCMonth() + 1,
+        serviceDayStartDate.getUTCDate(),
+        SERVICE_DAY_START_HOUR,
+        0,
+        0,
+        0,
+        SERVICE_TIME_ZONE
+    );
+    const endUtc = new Date(startUtc.getTime() + (24 * 60 * 60 * 1000));
+
+    return {
+        serviceDayKey,
+        startUtc,
+        endUtc
+    };
+}
+
+function getServiceIntervalIndex(date = new Date()) {
+    const parts = getDatePartsInServiceTimeZone(date);
+    const totalMinutes = (parts.hour * 60) + parts.minute;
+    const startMinutes = SERVICE_DAY_START_HOUR * 60;
+    const minutesSinceStart = (totalMinutes - startMinutes + (24 * 60)) % (24 * 60);
+    return Math.floor(minutesSinceStart / SNAPSHOT_INTERVAL_MINUTES);
+}
+
 class TrafficDatabase {
     constructor() {
         this.pool = new Pool({
@@ -24,7 +157,7 @@ class TrafficDatabase {
     async saveTrafficSnapshot(intervalData, segmentData, counterFlowData) {
         try {
             const now = new Date();
-            const dateKey = now.toISOString().split('T')[0];
+            const dateKey = getServiceDayKey(now);
             const intervalIndex = this.calculateIntervalIndex(now);
             
             const snapshotData = {
@@ -57,21 +190,23 @@ class TrafficDatabase {
         }
     }
     
-    // Get today's traffic data for API endpoint
+    // Get the current service day's traffic data for API endpoint.
     async getTodayTrafficData() {
         try {
-            const dateKey = new Date().toISOString().split('T')[0];
-            console.log(`🔍 DB READ: Querying for dateKey: ${dateKey}`);
+            const { serviceDayKey, startUtc, endUtc } = getCurrentServiceDayWindow(new Date());
+            const startIso = startUtc.toISOString();
+            const endIso = endUtc.toISOString();
+            console.log(`🔍 DB READ: Querying for service day ${serviceDayKey} (${startIso} → ${endIso}, ${SERVICE_TIME_ZONE}, ${SERVICE_DAY_START_HOUR}:00 start)`);
             
             const query = `
                 SELECT interval_index, raw_data, observed_at
                 FROM traffic_snapshots
-                WHERE date_key = $1
-                ORDER BY interval_index ASC;
+                WHERE observed_at >= $1 AND observed_at < $2
+                ORDER BY observed_at ASC;
             `;
             
-            const result = await this.pool.query(query, [dateKey]);
-            console.log(`🔍 DB read result: Found ${result.rows.length} rows for date ${dateKey}`);
+            const result = await this.pool.query(query, [startIso, endIso]);
+            console.log(`🔍 DB read result: Found ${result.rows.length} rows for service day ${serviceDayKey}`);
             
             if (result.rows.length === 0) {
                 // DEBUG: Check what dates are actually in the database
@@ -128,11 +263,9 @@ class TrafficDatabase {
         }
     }
     
-    // Calculate 2-minute interval index (0-719 for 24 hours)
+    // Calculate 2-minute interval index within the service day (4am->4am, 0-719).
     calculateIntervalIndex(date) {
-        const hours = date.getHours();
-        const minutes = date.getMinutes();
-        return Math.floor((hours * 60 + minutes) / 2);
+        return getServiceIntervalIndex(date);
     }
     
     // Get database statistics
