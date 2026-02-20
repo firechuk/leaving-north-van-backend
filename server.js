@@ -921,6 +921,7 @@ app.get('/health', (req, res) => {
 app.get('/api/traffic/today', async (req, res) => {
   try {
     let response;
+    const requestedServiceDays = Math.max(1, Math.min(7, Number.parseInt(req.query.serviceDays, 10) || 2));
     
     // Try database first if available
     if (db) {
@@ -930,7 +931,7 @@ app.get('/api/traffic/today', async (req, res) => {
         const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
           ? Math.max(0, Date.now() - latestMemoryIntervalMs)
           : null;
-        const dbData = await db.getTodayTrafficData();
+        const dbData = await db.getTodayTrafficData(requestedServiceDays);
         console.log(`🔍 DB data received: intervals=${dbData?.intervals?.length || 0}, segments=${Object.keys(dbData?.segments || {}).length}`);
         
         if (dbData && dbData.intervals.length > 0) {
@@ -979,6 +980,7 @@ app.get('/api/traffic/today', async (req, res) => {
               },
               fromDatabase: true,
               fromMemory: true,
+              serviceDays: requestedServiceDays,
               schemaCompatible: canMergeDbAndMemory,
               dbRecordCount: dbData.recordCount,
               latestIntervalAgeMs: mergedAgeMs,
@@ -1006,6 +1008,7 @@ app.get('/api/traffic/today', async (req, res) => {
                   Date.now() - new Date(dbData.counterFlow.statusSince).getTime() : null
               },
               fromDatabase: true,
+              serviceDays: requestedServiceDays,
               dbRecordCount: dbData.recordCount,
               latestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
               memoryLatestIntervalAgeMs: memoryDataAgeMs
@@ -1062,6 +1065,7 @@ app.get('/api/traffic/today', async (req, res) => {
           Date.now() - new Date(counterFlowData.statusSince).getTime() : null
       },
       fromDatabase: false,
+      serviceDays: requestedServiceDays,
       latestIntervalAgeMs: memoryDataAgeMs
     };
     

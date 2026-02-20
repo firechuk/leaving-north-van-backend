@@ -190,13 +190,18 @@ class TrafficDatabase {
         }
     }
     
-    // Get the current service day's traffic data for API endpoint.
-    async getTodayTrafficData() {
+    // Get traffic data for current + previous service days.
+    async getTodayTrafficData(serviceDays = 2) {
         try {
+            const normalizedServiceDays = Math.max(1, Math.min(7, Number(serviceDays) || 1));
             const { serviceDayKey, startUtc, endUtc } = getCurrentServiceDayWindow(new Date());
-            const startIso = startUtc.toISOString();
+            const windowStartUtc = new Date(startUtc.getTime() - ((normalizedServiceDays - 1) * 24 * 60 * 60 * 1000));
+            const windowStartIso = windowStartUtc.toISOString();
             const endIso = endUtc.toISOString();
-            console.log(`🔍 DB READ: Querying for service day ${serviceDayKey} (${startIso} → ${endIso}, ${SERVICE_TIME_ZONE}, ${SERVICE_DAY_START_HOUR}:00 start)`);
+            console.log(
+                `🔍 DB READ: Querying ${normalizedServiceDays} service day(s) ending ${serviceDayKey} (` +
+                `${windowStartIso} → ${endIso}, ${SERVICE_TIME_ZONE}, ${SERVICE_DAY_START_HOUR}:00 start)`
+            );
             
             const query = `
                 SELECT interval_index, raw_data, observed_at
@@ -205,8 +210,8 @@ class TrafficDatabase {
                 ORDER BY observed_at ASC;
             `;
             
-            const result = await this.pool.query(query, [startIso, endIso]);
-            console.log(`🔍 DB read result: Found ${result.rows.length} rows for service day ${serviceDayKey}`);
+            const result = await this.pool.query(query, [windowStartIso, endIso]);
+            console.log(`🔍 DB read result: Found ${result.rows.length} rows for service window ending ${serviceDayKey}`);
             
             if (result.rows.length === 0) {
                 // DEBUG: Check what dates are actually in the database
@@ -256,6 +261,7 @@ class TrafficDatabase {
                 intervals,
                 segments,
                 counterFlow,
+                serviceDays: normalizedServiceDays,
                 fromDatabase: true,
                 recordCount: result.rows.length,
                 validRecords: intervals.length,
