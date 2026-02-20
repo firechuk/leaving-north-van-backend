@@ -25,6 +25,7 @@ const HERE_API_KEY = process.env.HERE_API_KEY || 'YOUR_HERE_API_KEY_NEEDED';
 const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
+const TRAFFIC_DB_STALE_MAX_AGE_MS = 12 * 60 * 1000;
 
 // OPTIMIZED: Tier 1 + Tier 2 critical monitoring roads only
 // Reduced from 21 roads (282 segments) to 15 roads (~45 segments) to solve database crisis
@@ -257,6 +258,37 @@ const updateDebugRouteSnapshotFromFetch = (fetchResult, fetchedAt = new Date().t
     rawSegmentCount: fetchResult?.debugMeta?.rawSegmentCount || Object.keys(allSegments).length,
     filteredSegmentCount: fetchResult?.debugMeta?.filteredSegmentCount || 0
   };
+};
+
+const parseIntervalTimestampMs = (interval) => {
+  if (!interval || typeof interval !== 'object') return null;
+  const rawTimestamp = interval.timestamp;
+  if (rawTimestamp === undefined || rawTimestamp === null) return null;
+
+  if (rawTimestamp instanceof Date) {
+    const ms = rawTimestamp.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp)) {
+    if (rawTimestamp > 1e14) return Math.floor(rawTimestamp / 1000);
+    if (rawTimestamp < 1e12) return Math.floor(rawTimestamp * 1000);
+    return Math.floor(rawTimestamp);
+  }
+
+  const parsedMs = Date.parse(String(rawTimestamp));
+  return Number.isFinite(parsedMs) ? parsedMs : null;
+};
+
+const getLatestIntervalTimestampMs = (intervals) => {
+  if (!Array.isArray(intervals) || intervals.length === 0) return null;
+
+  for (let i = intervals.length - 1; i >= 0; i -= 1) {
+    const parsedMs = parseIntervalTimestampMs(intervals[i]);
+    if (Number.isFinite(parsedMs)) return parsedMs;
+  }
+
+  return null;
 };
 
 const buildTrackedDebugSegments = () => {
@@ -812,31 +844,44 @@ app.get('/api/traffic/today', async (req, res) => {
         console.log(`🔍 DB data received: intervals=${dbData?.intervals?.length || 0}, segments=${Object.keys(dbData?.segments || {}).length}`);
         
         if (dbData && dbData.intervals.length > 0) {
-        response = {
-          intervals: dbData.intervals,
-          segments: dbData.segments,
-          totalSegments: Object.keys(dbData.segments).length,
-          currentIntervalIndex: dbData.intervals.length - 1,
-          maxInterval: dbData.intervals.length - 1,
-          coverage: `North Vancouver comprehensive: ${Object.keys(dbData.segments).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
-          dataSource: 'database-persistent',
-          counterFlow: {
-            status: dbData.counterFlow.currentStatus,
-            lanesOutbound: dbData.counterFlow.lanesOutbound || 1,
-            statusSince: dbData.counterFlow.statusSince,
-            lastChecked: dbData.counterFlow.lastChecked,
-            durationMs: dbData.counterFlow.statusSince ? 
-              Date.now() - new Date(dbData.counterFlow.statusSince).getTime() : null
-          },
-          fromDatabase: true,
-          dbRecordCount: dbData.recordCount
-        };
-        console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
-        res.json(response);
-        return;
-      } else {
-        console.log('📊 No database data found (empty intervals), falling back to memory...');
-      }
+          const latestDbIntervalMs = getLatestIntervalTimestampMs(dbData.intervals);
+          const dbDataAgeMs = Number.isFinite(latestDbIntervalMs)
+            ? Math.max(0, Date.now() - latestDbIntervalMs)
+            : Number.POSITIVE_INFINITY;
+          const isDbFreshEnough = dbDataAgeMs <= TRAFFIC_DB_STALE_MAX_AGE_MS;
+
+          if (!isDbFreshEnough) {
+            console.warn(
+              `⚠️ DB data is stale (age ${Math.round(dbDataAgeMs / 1000)}s, threshold ${Math.round(TRAFFIC_DB_STALE_MAX_AGE_MS / 1000)}s). Falling back to memory.`
+            );
+          } else {
+            response = {
+              intervals: dbData.intervals,
+              segments: dbData.segments,
+              totalSegments: Object.keys(dbData.segments).length,
+              currentIntervalIndex: dbData.intervals.length - 1,
+              maxInterval: dbData.intervals.length - 1,
+              coverage: `North Vancouver comprehensive: ${Object.keys(dbData.segments).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
+              dataSource: 'database-persistent',
+              counterFlow: {
+                status: dbData.counterFlow.currentStatus,
+                lanesOutbound: dbData.counterFlow.lanesOutbound || 1,
+                statusSince: dbData.counterFlow.statusSince,
+                lastChecked: dbData.counterFlow.lastChecked,
+                durationMs: dbData.counterFlow.statusSince ? 
+                  Date.now() - new Date(dbData.counterFlow.statusSince).getTime() : null
+              },
+              fromDatabase: true,
+              dbRecordCount: dbData.recordCount,
+              latestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null
+            };
+            console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
+            res.json(response);
+            return;
+          }
+        } else {
+          console.log('📊 No database data found (empty intervals), falling back to memory...');
+        }
       } catch (dbError) {
         console.error('❌ Database read error, falling back to memory:', dbError.message);
         console.error('❌ Full database read error:', dbError);
@@ -849,6 +894,14 @@ app.get('/api/traffic/today', async (req, res) => {
     // If no data, collect some now
     if (trafficIntervals.length === 0) {
       await collectTrafficData();
+    }
+
+    const latestMemoryIntervalMs = getLatestIntervalTimestampMs(trafficIntervals);
+    const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
+      ? Math.max(0, Date.now() - latestMemoryIntervalMs)
+      : null;
+    if (memoryDataAgeMs !== null && memoryDataAgeMs > TRAFFIC_DB_STALE_MAX_AGE_MS) {
+      console.warn(`⚠️ Memory traffic data appears stale (${Math.round(memoryDataAgeMs / 1000)}s old).`);
     }
     
     response = {
@@ -867,7 +920,8 @@ app.get('/api/traffic/today', async (req, res) => {
         durationMs: counterFlowData.statusSince ? 
           Date.now() - new Date(counterFlowData.statusSince).getTime() : null
       },
-      fromDatabase: false
+      fromDatabase: false,
+      latestIntervalAgeMs: memoryDataAgeMs
     };
     
     res.json(response);
