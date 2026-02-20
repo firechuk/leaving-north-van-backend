@@ -26,6 +26,7 @@ const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 const TRAFFIC_DB_STALE_MAX_AGE_MS = 12 * 60 * 1000;
+const MIN_FILTERED_SEGMENTS_FOR_TRACKED = 12;
 
 // OPTIMIZED: Tier 1 + Tier 2 critical monitoring roads only
 // Reduced from 21 roads (282 segments) to 15 roads (~45 segments) to solve database crisis
@@ -446,13 +447,24 @@ const fetchHereTrafficData = async () => {
       });
     };
     
-    // Filter segments to only critical roads first
+    // Filter segments to only critical roads first.
     const filteredSegments = rawSegments.filter(isSegmentInCriticalRoads);
-    console.log(`🎯 Filtered ${rawSegments.length} segments to ${filteredSegments.length} critical road segments`);
+    let selectedSegments = filteredSegments;
+    let filterMode = 'critical-only';
+    if (filteredSegments.length < MIN_FILTERED_SEGMENTS_FOR_TRACKED) {
+      filterMode = 'raw-fallback';
+      selectedSegments = rawSegments;
+      console.warn(
+        `⚠️ Filtered segment count too low (${filteredSegments.length}). Falling back to all ${rawSegments.length} HERE segments.`
+      );
+    }
+    console.log(`🎯 Filtered ${rawSegments.length} segments to ${filteredSegments.length} critical road segments (serving ${selectedSegments.length}, mode=${filterMode})`);
     
     // DEBUG: Log a few kept/rejected segments for troubleshooting.
-    const kept = filteredSegments;
-    const rejected = rawSegments.filter(seg => !isSegmentInCriticalRoads(seg));
+    const kept = selectedSegments;
+    const rejected = filterMode === 'raw-fallback'
+      ? []
+      : rawSegments.filter(seg => !isSegmentInCriticalRoads(seg));
     
     console.log('🔍 DEBUG - Sample segments KEPT:');
     kept.slice(0, 3).forEach((seg, i) => {
@@ -475,15 +487,17 @@ const fetchHereTrafficData = async () => {
     console.log(`🏗️  DEBUG - Found ${majorRoads.length} segments with major infrastructure keywords:`);
     majorRoads.slice(0, 5).forEach((seg, i) => {
       const coords = seg.location?.shape?.links?.[0]?.points?.[0];
-      const inTrackedSet = isSegmentInCriticalRoads(seg) ? 'KEPT' : 'REJECTED';
+      const inTrackedSet = filterMode === 'raw-fallback'
+        ? 'KEPT'
+        : (isSegmentInCriticalRoads(seg) ? 'KEPT' : 'REJECTED');
       console.log(`  ${i + 1}. ${inTrackedSet}: ${seg.location?.description} at ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)}`);
     });
     
-    // Convert filtered HERE traffic segments to tracked payload.
+    // Convert selected HERE traffic segments to tracked payload.
     const trafficData = [];
     const segmentMetadata = {};
     
-    filteredSegments.forEach((segment, index) => {
+    selectedSegments.forEach((segment, index) => {
       const record = buildHereSegmentRecord(segment, index);
       if (!record) return;
 
@@ -520,7 +534,7 @@ const fetchHereTrafficData = async () => {
         .filter((value) => typeof value === 'string' && value.length > 0)
     )];
 
-    console.log(`✅ Processed ${trafficData.length} critical road segments (filtered from ${rawSegments.length} total)`);
+    console.log(`✅ Processed ${trafficData.length} tracked segments (filtered from ${rawSegments.length} total, mode=${filterMode})`);
     console.log(`📍 All-routes debug coverage: ${Object.keys(allSegmentMetadata).length} segments`);
 
     return {
@@ -532,6 +546,8 @@ const fetchHereTrafficData = async () => {
         rawSegmentCount: rawSegments.length,
         allSegmentCount: Object.keys(allSegmentMetadata).length,
         filteredSegmentCount: filteredSegments.length,
+        selectedSegmentCount: selectedSegments.length,
+        filterMode,
         trackedSourceIds
       }
     };
