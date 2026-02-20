@@ -4,6 +4,7 @@ const axios = require('axios');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 // const cheerio = require('cheerio'); // Removed for Node compatibility
 const TrafficDatabase = require('./database');
 
@@ -22,6 +23,8 @@ app.use(express.json());
 // HERE API configuration
 const HERE_API_KEY = process.env.HERE_API_KEY || 'YOUR_HERE_API_KEY_NEEDED';
 const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
+const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
+const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 
 // OPTIMIZED: Tier 1 + Tier 2 critical monitoring roads only
 // Reduced from 21 roads (282 segments) to 15 roads (~45 segments) to solve database crisis
@@ -84,6 +87,201 @@ let counterFlowData = {
   history: [] // array of status changes for pattern analysis
 };
 
+// Debug route overlay cache (all routes + tracked overlay)
+let debugRouteSnapshot = {
+  fetchedAt: null,
+  dataSource: 'uninitialized',
+  allSegments: {},
+  trackedSourceIds: [],
+  rawSegmentCount: 0,
+  filteredSegmentCount: 0
+};
+
+const toFiniteNumber = (value) => {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+};
+
+const addUniqueCoordinate = (target, point) => {
+  if (!Array.isArray(target) || !Array.isArray(point) || point.length < 2) return;
+  const [lng, lat] = point;
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+
+  const previous = target[target.length - 1];
+  if (previous && Math.abs(previous[0] - lng) < 1e-7 && Math.abs(previous[1] - lat) < 1e-7) {
+    return;
+  }
+  target.push([lng, lat]);
+};
+
+const extractCoordinatesFromHereSegment = (segment) => {
+  const coordinates = [];
+  const links = segment?.location?.shape?.links;
+  if (!Array.isArray(links)) return coordinates;
+
+  links.forEach((link) => {
+    const points = Array.isArray(link?.points) ? link.points : [];
+    points.forEach((point) => {
+      const lat = toFiniteNumber(point?.lat);
+      const lng = toFiniteNumber(point?.lng);
+      if (lat === null || lng === null) return;
+      addUniqueCoordinate(coordinates, [lng, lat]);
+    });
+  });
+
+  return coordinates;
+};
+
+const extractHereReference = (segment) => {
+  const refs = [];
+  const location = segment?.location || {};
+  const pushRef = (value) => {
+    if (value === undefined || value === null) return;
+    const text = String(value).trim();
+    if (!text) return;
+    refs.push(text);
+  };
+
+  pushRef(location.id);
+  pushRef(location.locationId);
+  pushRef(location.locationRef);
+
+  const links = location?.shape?.links;
+  if (Array.isArray(links)) {
+    links.forEach((link) => {
+      pushRef(link?.id);
+      pushRef(link?.linkId);
+      pushRef(link?.locationRef);
+      pushRef(link?.ref);
+    });
+  }
+
+  const uniqueRefs = [...new Set(refs)];
+  if (uniqueRefs.length === 0) return null;
+  return uniqueRefs.join('|');
+};
+
+const extractNumericTokens = (...values) => {
+  const tokens = new Set();
+  values.forEach((value) => {
+    if (value === undefined || value === null) return;
+    const text = String(value);
+    const matches = text.match(/\d+/g);
+    if (!matches) return;
+    matches.forEach((match) => tokens.add(match));
+  });
+  return [...tokens];
+};
+
+const buildStableHereSegmentId = (segment, coordinates) => {
+  const description = String(segment?.location?.description || '').trim().toLowerCase();
+  const hereReference = String(extractHereReference(segment) || '').trim().toLowerCase();
+  const roundedCoordinates = coordinates
+    .map(([lng, lat]) => `${lng.toFixed(5)},${lat.toFixed(5)}`)
+    .join(';');
+  const hashInput = `${description}|${hereReference}|${roundedCoordinates}|${coordinates.length}`;
+  const digest = crypto.createHash('sha1').update(hashInput).digest('hex').slice(0, 14);
+  return `here-net-${digest}`;
+};
+
+const buildHereSegmentRecord = (segment, index) => {
+  const coordinates = extractCoordinatesFromHereSegment(segment);
+  if (coordinates.length < 2) return null;
+
+  const currentFlow = segment?.currentFlow || {};
+  const freeFlow = segment?.freeFlow || {};
+  const currentSpeed = toFiniteNumber(currentFlow.speed);
+  const freeFlowSpeed = toFiniteNumber(currentFlow.freeFlow ?? freeFlow.speed ?? currentSpeed);
+  const jamFactor = toFiniteNumber(currentFlow.jamFactor);
+  const confidence = toFiniteNumber(currentFlow.confidence);
+  const description = String(segment?.location?.description || `Traffic Segment ${index + 1}`).trim();
+  const hereReference = extractHereReference(segment);
+  const sourceId = buildStableHereSegmentId(segment, coordinates);
+  const numericIds = extractNumericTokens(sourceId, hereReference, description);
+
+  return {
+    sourceId,
+    name: description || `Traffic Segment ${index + 1}`,
+    description: description || null,
+    coordinates,
+    type: 'road',
+    hereReference,
+    numericIds,
+    currentSpeed,
+    freeFlowSpeed,
+    jamFactor,
+    confidence
+  };
+};
+
+const buildFallbackAllSegmentsFromTracked = (segments = {}) => {
+  const fallback = {};
+  Object.entries(segments).forEach(([segmentId, segment]) => {
+    const coordinates = Array.isArray(segment?.coordinates) ? segment.coordinates : [];
+    if (coordinates.length < 2) return;
+
+    const sourceId = typeof segment?.sourceId === 'string' && segment.sourceId
+      ? segment.sourceId
+      : `tracked-${segmentId}`;
+    fallback[sourceId] = {
+      id: sourceId,
+      name: segment?.name || segmentId,
+      description: segment?.description || segment?.name || segmentId,
+      coordinates,
+      type: segment?.type || 'road',
+      hereReference: segment?.hereReference || null,
+      numericIds: extractNumericTokens(sourceId, segment?.name, segment?.hereReference),
+      currentSpeed: null,
+      freeFlowSpeed: null,
+      jamFactor: null,
+      confidence: null
+    };
+  });
+  return fallback;
+};
+
+const updateDebugRouteSnapshotFromFetch = (fetchResult, fetchedAt = new Date().toISOString()) => {
+  const allSegments = fetchResult?.allSegmentMetadata || {};
+  if (Object.keys(allSegments).length === 0) return;
+
+  const trackedSourceIds = fetchResult?.debugMeta?.trackedSourceIds ||
+    Object.values(fetchResult?.segmentMetadata || {})
+      .map((segment) => segment?.sourceId)
+      .filter((value) => typeof value === 'string' && value.length > 0);
+
+  debugRouteSnapshot = {
+    fetchedAt,
+    dataSource: fetchResult?.debugMeta?.dataSource || 'here-live',
+    allSegments,
+    trackedSourceIds: [...new Set(trackedSourceIds)],
+    rawSegmentCount: fetchResult?.debugMeta?.rawSegmentCount || Object.keys(allSegments).length,
+    filteredSegmentCount: fetchResult?.debugMeta?.filteredSegmentCount || 0
+  };
+};
+
+const buildTrackedDebugSegments = () => {
+  const trackedSegments = {};
+  Object.entries(segmentData).forEach(([segmentId, segment]) => {
+    const coordinates = Array.isArray(segment?.coordinates) ? segment.coordinates : [];
+    if (coordinates.length < 2) return;
+    const sourceId = typeof segment?.sourceId === 'string' && segment.sourceId
+      ? segment.sourceId
+      : null;
+
+    trackedSegments[segmentId] = {
+      id: segmentId,
+      sourceId,
+      name: segment?.name || segmentId,
+      description: segment?.description || segment?.name || segmentId,
+      coordinates,
+      type: segment?.type || 'road',
+      hereReference: segment?.hereReference || null,
+      numericIds: extractNumericTokens(segmentId, sourceId, segment?.name, segment?.hereReference)
+    };
+  });
+  return trackedSegments;
+};
+
 // Generate segments from road bboxes
 const initializeSegments = () => {
   console.log('Initializing North Vancouver road segments...');
@@ -130,53 +328,81 @@ const initializeSegments = () => {
 
 // Fetch traffic data from HERE API using efficient bounding box approach
 const fetchHereTrafficData = async () => {
+  const buildSyntheticFallback = (dataSourceLabel = 'synthetic-fallback') => {
+    const syntheticData = generateSyntheticTrafficData();
+    const allSegmentMetadata = buildFallbackAllSegmentsFromTracked(segmentData);
+    const trackedSourceIds = Object.entries(segmentData)
+      .map(([segmentId, segment]) => {
+        if (typeof segment?.sourceId === 'string' && segment.sourceId) {
+          return segment.sourceId;
+        }
+        return `tracked-${segmentId}`;
+      });
+
+    return {
+      trafficData: syntheticData,
+      segmentMetadata: {},
+      allSegmentMetadata,
+      debugMeta: {
+        dataSource: dataSourceLabel,
+        rawSegmentCount: Object.keys(allSegmentMetadata).length,
+        allSegmentCount: Object.keys(allSegmentMetadata).length,
+        filteredSegmentCount: syntheticData.length,
+        trackedSourceIds
+      }
+    };
+  };
+
   if (!HERE_API_KEY || HERE_API_KEY === 'YOUR_HERE_API_KEY_NEEDED') {
     console.log('⚠️ HERE API key not configured, using synthetic data');
-    const syntheticData = generateSyntheticTrafficData();
-    return { trafficData: syntheticData, segmentMetadata: {} };
+    return buildSyntheticFallback('synthetic-no-here-key');
   }
   
   try {
     console.log('Fetching traffic data from HERE API (filtered for Tier 1+2 roads only)...');
     
-    // OPTIMIZATION: Still use single bounding box but filter results to only Tier 1+2 roads
-    // This reduces segments from 279 to ~45 while maintaining API efficiency
-    const northVanBBox = "-123.187,49.300,-123.020,49.400";
-    
     const response = await axios.get(HERE_BASE_URL, {
       params: {
-        'in': `bbox:${northVanBBox}`,
+        'in': `bbox:${NORTH_VAN_BBOX}`,
         'locationReferencing': 'shape',
         'apikey': HERE_API_KEY
       },
       timeout: 10000
     });
     
-    console.log(`✅ HERE API returned ${response.data?.results?.length || 0} traffic segments`);
+    const rawSegments = Array.isArray(response?.data?.results) ? response.data.results : [];
+    console.log(`✅ HERE API returned ${rawSegments.length} traffic segments`);
     
-    if (!response.data || !response.data.results || response.data.results.length === 0) {
+    if (rawSegments.length === 0) {
       console.log('⚠️ No traffic data in HERE response, using synthetic data');
-      return generateSyntheticTrafficData();
+      return buildSyntheticFallback('synthetic-empty-here-response');
     }
+
+    // Build "all segments" payload for debug overlay (pink layer).
+    const allSegmentMetadata = {};
+    rawSegments.forEach((segment, index) => {
+      const record = buildHereSegmentRecord(segment, index);
+      if (!record) return;
+
+      allSegmentMetadata[record.sourceId] = {
+        id: record.sourceId,
+        name: record.name,
+        description: record.description,
+        coordinates: record.coordinates,
+        type: record.type,
+        hereReference: record.hereReference,
+        numericIds: record.numericIds,
+        currentSpeed: record.currentSpeed,
+        freeFlowSpeed: record.freeFlowSpeed,
+        jamFactor: record.jamFactor,
+        confidence: record.confidence
+      };
+    });
     
     // OPTIMIZATION: Filter segments to only Tier 1+2 roads before processing
     // Helper function to check if coordinates intersect with any of our critical roads
     const isSegmentInCriticalRoads = (segment) => {
-      const shape = segment.location?.shape;
-      if (!shape || !shape.links || !Array.isArray(shape.links)) return false;
-      
-      // Extract coordinates from segment
-      const segmentCoords = [];
-      shape.links.forEach(link => {
-        if (link.points && Array.isArray(link.points)) {
-          link.points.forEach(point => {
-            if (point.lat && point.lng) {
-              segmentCoords.push([point.lng, point.lat]);
-            }
-          });
-        }
-      });
-      
+      const segmentCoords = extractCoordinatesFromHereSegment(segment);
       if (segmentCoords.length === 0) return false;
       
       // Check if any coordinate falls within any of our critical road bounding boxes
@@ -189,27 +415,27 @@ const fetchHereTrafficData = async () => {
     };
     
     // Filter segments to only critical roads first
-    const filteredSegments = response.data.results.filter(isSegmentInCriticalRoads);
-    console.log(`🎯 Filtered ${response.data.results.length} segments to ${filteredSegments.length} critical road segments`);
+    const filteredSegments = rawSegments.filter(isSegmentInCriticalRoads);
+    console.log(`🎯 Filtered ${rawSegments.length} segments to ${filteredSegments.length} critical road segments`);
     
-    // DEBUG: Log some example segments that were kept vs rejected for troubleshooting
-    const kept = response.data.results.filter(isSegmentInCriticalRoads);
-    const rejected = response.data.results.filter(seg => !isSegmentInCriticalRoads(seg));
+    // DEBUG: Log a few kept/rejected segments for troubleshooting.
+    const kept = filteredSegments;
+    const rejected = rawSegments.filter(seg => !isSegmentInCriticalRoads(seg));
     
     console.log('🔍 DEBUG - Sample segments KEPT:');
     kept.slice(0, 3).forEach((seg, i) => {
       const coords = seg.location?.shape?.links?.[0]?.points?.[0];
-      console.log(`  ${i+1}. ${coords?.lat.toFixed(6)},${coords?.lng.toFixed(6)} - Road: ${seg.location?.description || 'Unknown'}`);
+      console.log(`  ${i + 1}. ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)} - Road: ${seg.location?.description || 'Unknown'}`);
     });
     
     console.log('🔍 DEBUG - Sample segments REJECTED:');  
     rejected.slice(0, 3).forEach((seg, i) => {
       const coords = seg.location?.shape?.links?.[0]?.points?.[0];
-      console.log(`  ${i+1}. ${coords?.lat.toFixed(6)},${coords?.lng.toFixed(6)} - Road: ${seg.location?.description || 'Unknown'}`);
+      console.log(`  ${i + 1}. ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)} - Road: ${seg.location?.description || 'Unknown'}`);
     });
     
     // DEBUG: Specifically look for major infrastructure keywords
-    const majorRoads = response.data.results.filter(seg => {
+    const majorRoads = rawSegments.filter(seg => {
       const desc = (seg.location?.description || '').toLowerCase();
       return desc.includes('highway') || desc.includes('bridge') || desc.includes('trans-canada') || desc.includes('ironworkers') || desc.includes('lions gate');
     });
@@ -217,107 +443,70 @@ const fetchHereTrafficData = async () => {
     console.log(`🏗️  DEBUG - Found ${majorRoads.length} segments with major infrastructure keywords:`);
     majorRoads.slice(0, 5).forEach((seg, i) => {
       const coords = seg.location?.shape?.links?.[0]?.points?.[0];
-      const kept = isSegmentInCriticalRoads(seg) ? 'KEPT' : 'REJECTED';
-      console.log(`  ${i+1}. ${kept}: ${seg.location?.description} at ${coords?.lat.toFixed(6)},${coords?.lng.toFixed(6)}`);
+      const inTrackedSet = isSegmentInCriticalRoads(seg) ? 'KEPT' : 'REJECTED';
+      console.log(`  ${i + 1}. ${inTrackedSet}: ${seg.location?.description} at ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)}`);
     });
     
-    // Convert filtered HERE traffic segments to our format
+    // Convert filtered HERE traffic segments to tracked payload.
     const trafficData = [];
     const segmentMetadata = {};
     
     filteredSegments.forEach((segment, index) => {
-      // Extract traffic flow data
-      const currentFlow = segment.currentFlow || {};
-      const freeFlow = segment.freeFlow || {};
-      
-      // HERE API puts free flow speed inside currentFlow object
-      const currentSpeed = currentFlow.speed || 50;
-      const freeFlowSpeed = currentFlow.freeFlow || freeFlow.speed || currentSpeed || 50;
+      const record = buildHereSegmentRecord(segment, index);
+      if (!record) return;
+
+      const currentSpeed = record.currentSpeed !== null ? record.currentSpeed : 50;
+      const freeFlowSpeed = record.freeFlowSpeed !== null ? record.freeFlowSpeed : currentSpeed || 50;
       const flowRatio = freeFlowSpeed > 0 ? Math.min(1.0, currentSpeed / freeFlowSpeed) : 1.0;
-      
-      // Create segment data with real coordinates from HERE
       const segmentId = `here-0-${index}`;
       
-      // Extract coordinates from HERE API's nested structure
-      let geojsonCoords = [];
-      const shape = segment.location?.shape;
-      
-      // DETAILED DEBUG: Log coordinate extraction process
-      if (index < 3) { // Debug first 3 segments
-        console.log(`🔍 COORD DEBUG ${index}: shape=${!!shape}, links=${Array.isArray(shape?.links)}, linksCount=${shape?.links?.length || 0}`);
-        if (shape?.links) {
-          shape.links.forEach((link, linkIdx) => {
-            console.log(`  Link ${linkIdx}: points=${Array.isArray(link.points)}, pointsCount=${link.points?.length || 0}`);
-            if (link.points && linkIdx === 0) {
-              console.log(`  Sample point: ${JSON.stringify(link.points[0])}`);
-            }
-          });
-        }
-      }
-      
-      if (shape && shape.links && Array.isArray(shape.links)) {
-        // Flatten all points from all links into a single coordinate array
-        shape.links.forEach(link => {
-          if (link.points && Array.isArray(link.points)) {
-            link.points.forEach(point => {
-              if (point.lat && point.lng) {
-                geojsonCoords.push([point.lng, point.lat]);
-              }
-            });
-          }
-        });
-      } else {
-        // DEBUG: Log why coordinate extraction failed
-        if (index < 5) {
-          console.log(`⚠️  COORD FAIL ${index}: shape=${!!shape}, shape.links=${!!shape?.links}, isArray=${Array.isArray(shape?.links)}`);
-        }
-      }
-      
       trafficData.push({
-        segmentId: segmentId,
-        ratio: Math.max(0.1, flowRatio), // Real traffic data restored
+        segmentId,
+        ratio: Math.max(0.1, flowRatio),
         speed: currentSpeed,
-        freeFlowSpeed: freeFlowSpeed,
-        jamFactor: currentFlow.jamFactor || 0,
-        confidence: currentFlow.confidence || 1.0
+        freeFlowSpeed,
+        jamFactor: record.jamFactor ?? 0,
+        confidence: record.confidence ?? 1.0
       });
       
-      // Store segment metadata for frontend (with coordinate validation)
-      if (geojsonCoords.length >= 2) {
+      if (record.coordinates.length >= 2) {
         segmentMetadata[segmentId] = {
-          name: `Traffic Segment ${index + 1}`,
-          coordinates: geojsonCoords,
-          type: 'road', // HERE doesn't categorize, so use generic
-          originalData: {
-            shape: shape,
-            currentFlow: currentFlow,
-            freeFlow: freeFlow
-          }
+          name: record.name,
+          description: record.description,
+          coordinates: record.coordinates,
+          type: record.type,
+          sourceId: record.sourceId,
+          hereReference: record.hereReference,
+          numericIds: record.numericIds
         };
-        if (index < 3) {
-          console.log(`✅ COORD SUCCESS ${index}: ${geojsonCoords.length} coordinates extracted`);
-        }
-      } else {
-        console.log(`❌ COORD FAIL ${segmentId} - insufficient coordinates: ${geojsonCoords.length}`);
       }
     });
     
-    console.log(`✅ Processed ${trafficData.length} critical road segments (filtered from ${response.data.results.length} total)`);
-    
-    // DEBUG: Check coordinate quality
-    const segmentsWithCoords = Object.values(segmentMetadata).filter(seg => seg.coordinates && seg.coordinates.length >= 2);
-    console.log(`📍 Segments with valid coordinates: ${segmentsWithCoords.length}/${Object.keys(segmentMetadata).length}`);
-    
-    if (segmentsWithCoords.length > 0) {
-      const sample = segmentsWithCoords[0];
-      console.log(`📍 Sample coordinates: ${sample.coordinates[0]} to ${sample.coordinates[sample.coordinates.length-1]}`);
-    }
-    return { trafficData, segmentMetadata };
+    const trackedSourceIds = [...new Set(
+      Object.values(segmentMetadata)
+        .map((segment) => segment?.sourceId)
+        .filter((value) => typeof value === 'string' && value.length > 0)
+    )];
+
+    console.log(`✅ Processed ${trafficData.length} critical road segments (filtered from ${rawSegments.length} total)`);
+    console.log(`📍 All-routes debug coverage: ${Object.keys(allSegmentMetadata).length} segments`);
+
+    return {
+      trafficData,
+      segmentMetadata,
+      allSegmentMetadata,
+      debugMeta: {
+        dataSource: 'here-live',
+        rawSegmentCount: rawSegments.length,
+        allSegmentCount: Object.keys(allSegmentMetadata).length,
+        filteredSegmentCount: filteredSegments.length,
+        trackedSourceIds
+      }
+    };
     
   } catch (error) {
     console.log('❌ HERE API failed, falling back to synthetic data:', error.response?.status, error.message);
-    const syntheticData = generateSyntheticTrafficData();
-    return { trafficData: syntheticData, segmentMetadata: {} };
+    return buildSyntheticFallback('synthetic-here-error');
   }
 };
 
@@ -503,20 +692,26 @@ const collectTrafficData = async () => {
     const timestamp = new Date().toISOString();
     console.log(`🚗 Collecting traffic data at ${timestamp}`);
     
-    const { trafficData, segmentMetadata } = await fetchHereTrafficData();
+    const fetchResult = await fetchHereTrafficData();
+    const trafficData = Array.isArray(fetchResult?.trafficData) ? fetchResult.trafficData : [];
+    const segmentMetadata = fetchResult?.segmentMetadata && typeof fetchResult.segmentMetadata === 'object'
+      ? fetchResult.segmentMetadata
+      : {};
     
     // Replace segment data entirely with new HERE metadata
     if (segmentMetadata && Object.keys(segmentMetadata).length > 0) {
       segmentData = segmentMetadata; // REPLACE, don't merge
       console.log(`📍 Replaced segment data with ${Object.keys(segmentMetadata).length} HERE segments`);
     }
+
+    updateDebugRouteSnapshotFromFetch(fetchResult, timestamp);
     
     // Convert to interval format
     const interval = {
       timestamp: timestamp,
     };
     
-    trafficData.forEach(data => {
+    trafficData.forEach((data) => {
       interval[data.segmentId] = data.ratio;
     });
     
@@ -532,7 +727,7 @@ const collectTrafficData = async () => {
       try {
         // Clean segmentMetadata for database storage (remove complex HERE API objects)
         const cleanSegmentData = {};
-        Object.keys(segmentMetadata).forEach(segmentId => {
+        Object.keys(segmentMetadata).forEach((segmentId) => {
           const segment = segmentMetadata[segmentId];
           cleanSegmentData[segmentId] = {
             name: segment.name,
@@ -682,6 +877,90 @@ app.get('/api/traffic/today', async (req, res) => {
     res.status(500).json({ 
       error: 'Failed to fetch traffic data',
       details: error.message 
+    });
+  }
+});
+
+// Debug endpoint: all North Van routes (pink) + tracked routes (blue)
+app.get('/api/debug/routes', async (req, res) => {
+  try {
+    const refreshParam = String(req.query.refresh || '').toLowerCase();
+    const forceRefresh = refreshParam === '1' || refreshParam === 'true' || refreshParam === 'yes';
+
+    const existingCacheAgeMs = debugRouteSnapshot.fetchedAt
+      ? Date.now() - new Date(debugRouteSnapshot.fetchedAt).getTime()
+      : Number.POSITIVE_INFINITY;
+    const cacheHasData = Object.keys(debugRouteSnapshot.allSegments || {}).length > 0;
+    const shouldRefresh = forceRefresh || !cacheHasData || existingCacheAgeMs > DEBUG_ROUTE_CACHE_TTL_MS;
+
+    if (shouldRefresh) {
+      const refreshedAt = new Date().toISOString();
+      const refreshResult = await fetchHereTrafficData();
+      updateDebugRouteSnapshotFromFetch(refreshResult, refreshedAt);
+
+      // If HERE is unavailable, still provide a usable overlay from current tracked geometry.
+      if (Object.keys(debugRouteSnapshot.allSegments || {}).length === 0) {
+        const fallbackAllSegments = buildFallbackAllSegmentsFromTracked(segmentData);
+        debugRouteSnapshot = {
+          fetchedAt: refreshedAt,
+          dataSource: 'tracked-fallback',
+          allSegments: fallbackAllSegments,
+          trackedSourceIds: Object.keys(fallbackAllSegments),
+          rawSegmentCount: Object.keys(fallbackAllSegments).length,
+          filteredSegmentCount: Object.keys(segmentData).length
+        };
+      }
+    }
+
+    const trackedSegments = buildTrackedDebugSegments();
+    const fallbackAllSegments = buildFallbackAllSegmentsFromTracked(segmentData);
+    const baseAllSegments = Object.keys(debugRouteSnapshot.allSegments || {}).length > 0
+      ? debugRouteSnapshot.allSegments
+      : fallbackAllSegments;
+
+    const trackedSourceIds = new Set(debugRouteSnapshot.trackedSourceIds || []);
+    Object.values(trackedSegments).forEach((segment) => {
+      if (typeof segment?.sourceId === 'string' && segment.sourceId) {
+        trackedSourceIds.add(segment.sourceId);
+      }
+    });
+
+    const allSegments = {};
+    let overlapSegments = 0;
+    Object.entries(baseAllSegments).forEach(([sourceId, segment]) => {
+      const tracked = trackedSourceIds.has(sourceId);
+      if (tracked) overlapSegments += 1;
+      allSegments[sourceId] = {
+        ...segment,
+        tracked
+      };
+    });
+
+    const cacheAgeMs = debugRouteSnapshot.fetchedAt
+      ? Math.max(0, Date.now() - new Date(debugRouteSnapshot.fetchedAt).getTime())
+      : null;
+
+    res.json({
+      timestamp: new Date().toISOString(),
+      fetchedAt: debugRouteSnapshot.fetchedAt,
+      dataSource: debugRouteSnapshot.dataSource,
+      bbox: NORTH_VAN_BBOX,
+      summary: {
+        allSegments: Object.keys(allSegments).length,
+        trackedSegments: Object.keys(trackedSegments).length,
+        overlapSegments,
+        rawSegmentCount: debugRouteSnapshot.rawSegmentCount,
+        filteredSegmentCount: debugRouteSnapshot.filteredSegmentCount,
+        cacheAgeMs
+      },
+      allSegments,
+      trackedSegments
+    });
+  } catch (error) {
+    console.error('❌ Error in /api/debug/routes:', error);
+    res.status(500).json({
+      error: 'Failed to fetch debug route data',
+      details: error.message
     });
   }
 });
