@@ -763,7 +763,7 @@ const BC_ATIS_URL = 'http://www.th.gov.bc.ca/ATIS/lgcws/private_status.htm';
 const extractVdsSection = (html, vdsId) => {
   if (typeof html !== 'string' || !html) return null;
   const escapedId = String(vdsId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const regex = new RegExp(`VDS\\s*ID:\\s*${escapedId}\\b[\\s\\S]*?(?=VDS\\s*ID:|ATC\\s*ID:|$)`, 'i');
+  const regex = new RegExp(`VDS\\s*ID\\s*[:#-]?\\s*${escapedId}\\b[\\s\\S]*?(?=VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`, 'i');
   const match = html.match(regex);
   return match ? match[0] : null;
 };
@@ -772,32 +772,87 @@ const extractLaneSection = (vdsSection, laneNumber) => {
   if (typeof vdsSection !== 'string' || !vdsSection) return null;
   const laneId = String(laneNumber).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const regex = new RegExp(
-    `Lane\\s*Number:\\s*${laneId}\\b[\\s\\S]*?(?=Lane\\s*Number:\\s*\\d+\\b|VDS\\s*ID:|ATC\\s*ID:|$)`,
+    `Lane(?:\\s*Number)?\\s*[:#-]?\\s*${laneId}\\b[\\s\\S]*?(?=Lane(?:\\s*Number)?\\s*[:#-]?\\s*\\d+\\b|VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`,
     'i'
   );
   const match = vdsSection.match(regex);
   return match ? match[0] : null;
 };
 
+const decodeHtmlEntities = (text) => {
+  if (typeof text !== 'string' || !text) return '';
+  return text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#39;/g, '\'')
+    .replace(/&quot;/gi, '"');
+};
+
+const htmlToPlainText = (text) => {
+  if (typeof text !== 'string' || !text) return '';
+  return decodeHtmlEntities(
+    text
+      .replace(/<\s*br\s*\/?>/gi, '\n')
+      .replace(/<\/\s*(tr|p|div|li|td|th)\s*>/gi, '\n')
+      .replace(/<[^>]*>/g, ' ')
+  )
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s*\n\s*/g, '\n')
+    .trim();
+};
+
 const parseCurrentLaneStatuses = (laneSection) => {
   if (typeof laneSection !== 'string' || !laneSection) return [];
+  const plainText = htmlToPlainText(laneSection);
+  if (!plainText) return [];
+
   const statuses = [];
   const regex = /Current\s+(?:Upstream|Downstream)\s+Loop\s+Status\s*:?\s*([^\r\n]+)/gi;
   let match;
-  while ((match = regex.exec(laneSection)) !== null) {
+  while ((match = regex.exec(plainText)) !== null) {
     const statusText = String(match[1] || '')
-      .replace(/<[^>]*>/g, ' ')
-      .replace(/&nbsp;/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim();
     if (statusText) statuses.push(statusText);
   }
+
+  if (statuses.length === 0) {
+    const fallbackRegex = /Current\s+(?:Upstream|Downstream)\s+Status\s*:?\s*([^\r\n]+)/gi;
+    while ((match = fallbackRegex.exec(plainText)) !== null) {
+      const statusText = String(match[1] || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (statusText) statuses.push(statusText);
+    }
+  }
+
   return statuses;
 };
 
-const isCounterFlowClosedStatus = (statusText) => (
-  /counter[\s-]*flow\s+lane\s+is\s+closed/i.test(String(statusText || ''))
-);
+const classifyLaneClosedFromStatus = (statusText) => {
+  const text = String(statusText || '').trim().toLowerCase();
+  if (!text) return null;
+
+  if (/counter[\s-]*flow.*closed/.test(text)) return true;
+  if (/counter[\s-]*flow.*open/.test(text)) return false;
+  if (/\bclosed\b/.test(text)) return true;
+  if (/\bopen\b|\bok\b|\bnormal\b|\bclear\b/.test(text)) return false;
+  return null;
+};
+
+const resolveLaneClosed = (statuses = []) => {
+  const classifications = statuses
+    .map((status) => classifyLaneClosedFromStatus(status))
+    .filter((value) => typeof value === 'boolean');
+  if (classifications.length === 0) return null;
+
+  const hasClosed = classifications.includes(true);
+  const hasOpen = classifications.includes(false);
+  if (hasClosed && hasOpen) return null;
+  return hasClosed;
+};
 
 const scrapeCounterFlowData = async () => {
   try {
@@ -823,22 +878,12 @@ const scrapeCounterFlowData = async () => {
     const lane2Section = extractLaneSection(vds201Section, 2);
     const lane1CurrentStatuses = parseCurrentLaneStatuses(lane1Section);
     const lane2CurrentStatuses = parseCurrentLaneStatuses(lane2Section);
-
-    const legacyLane1Closed = /Lane(?:\s*Number:\s*1| 1)[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
-    const legacyLane2Closed = /Lane(?:\s*Number:\s*2| 2)[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
-
-    if (lane1CurrentStatuses.length === 0 || lane2CurrentStatuses.length === 0) {
-      console.log('⚠️ Could not parse current loop statuses for VDS 201 lanes; using legacy lane matcher fallback');
+    const lane1Closed = resolveLaneClosed(lane1CurrentStatuses);
+    const lane2Closed = resolveLaneClosed(lane2CurrentStatuses);
+    if (lane1Closed === null || lane2Closed === null) {
+      console.log('⚠️ Could not reliably resolve current lane states for VDS 201; skipping update');
+      return null;
     }
-
-    // Prefer CURRENT status parsing; fallback to legacy matcher if current lines are unavailable.
-    // Legacy matcher can over-read previous-state text, so it is only used as a fallback.
-    const lane1Closed = lane1CurrentStatuses.length > 0
-      ? lane1CurrentStatuses.some(isCounterFlowClosedStatus)
-      : legacyLane1Closed;
-    const lane2Closed = lane2CurrentStatuses.length > 0
-      ? lane2CurrentStatuses.some(isCounterFlowClosedStatus)
-      : legacyLane2Closed;
     
     // Determine counter-flow configuration
     let status;
@@ -874,6 +919,8 @@ const scrapeCounterFlowData = async () => {
         lane2Closed,
         lane1CurrentStatuses,
         lane2CurrentStatuses,
+        lane1SectionPreview: String(lane1Section || '').substring(0, 220),
+        lane2SectionPreview: String(lane2Section || '').substring(0, 220),
         vds201Section: vds201Section.substring(0, 500) // First 500 chars for debugging
       }
     };
