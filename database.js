@@ -212,16 +212,23 @@ class TrafficDatabase {
                 droppedLegacyConstraints.push(row.conname);
             }
 
-            await client.query(`
-                ALTER TABLE traffic_snapshots
-                ADD CONSTRAINT traffic_snapshots_date_key_interval_index_key
-                UNIQUE (date_key, interval_index);
-            `).catch((error) => {
-                // 42710: duplicate_object (constraint exists)
-                // 42P07: duplicate_table/relation (index backing the constraint already exists)
-                if (error && (error.code === '42710' || error.code === '42P07')) return;
-                throw error;
+            const hasTargetConstraint = uniqueConstraintsResult.rows.some((row) => {
+                if (String(row?.conname || '').toLowerCase() === 'traffic_snapshots_date_key_interval_index_key') {
+                    return true;
+                }
+                const columns = getIndexedColumnsFromDefinition(row?.definition);
+                return columns.length === 2 &&
+                    columns[0] === 'date_key' &&
+                    columns[1] === 'interval_index';
             });
+
+            if (!hasTargetConstraint) {
+                await client.query(`
+                    ALTER TABLE traffic_snapshots
+                    ADD CONSTRAINT traffic_snapshots_date_key_interval_index_key
+                    UNIQUE (date_key, interval_index);
+                `);
+            }
 
             const uniqueIndexesResult = await client.query(`
                 SELECT indexname, indexdef
