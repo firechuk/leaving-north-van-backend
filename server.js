@@ -750,10 +750,14 @@ const extractLaneSection = (vdsSection, laneNumber) => {
 const parseCurrentLaneStatuses = (laneSection) => {
   if (typeof laneSection !== 'string' || !laneSection) return [];
   const statuses = [];
-  const regex = /Current\s+(?:Upstream|Downstream)\s+Loop\s+Status:\s*([^\r\n<]+)/gi;
+  const regex = /Current\s+(?:Upstream|Downstream)\s+Loop\s+Status\s*:?\s*([^\r\n]+)/gi;
   let match;
   while ((match = regex.exec(laneSection)) !== null) {
-    const statusText = String(match[1] || '').trim();
+    const statusText = String(match[1] || '')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
     if (statusText) statuses.push(statusText);
   }
   return statuses;
@@ -788,15 +792,21 @@ const scrapeCounterFlowData = async () => {
     const lane1CurrentStatuses = parseCurrentLaneStatuses(lane1Section);
     const lane2CurrentStatuses = parseCurrentLaneStatuses(lane2Section);
 
+    const legacyLane1Closed = /Lane(?:\s*Number:\s*1| 1)[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
+    const legacyLane2Closed = /Lane(?:\s*Number:\s*2| 2)[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
+
     if (lane1CurrentStatuses.length === 0 || lane2CurrentStatuses.length === 0) {
-      console.log('⚠️ Could not parse current loop statuses for VDS 201 lanes');
-      return null;
+      console.log('⚠️ Could not parse current loop statuses for VDS 201 lanes; using legacy lane matcher fallback');
     }
 
-    // Determine lane closure from CURRENT statuses only.
-    // This avoids false positives from "Previous ... COUNTER FLOW LANE IS CLOSED".
-    const lane1Closed = lane1CurrentStatuses.some(isCounterFlowClosedStatus);
-    const lane2Closed = lane2CurrentStatuses.some(isCounterFlowClosedStatus);
+    // Prefer CURRENT status parsing; fallback to legacy matcher if current lines are unavailable.
+    // Legacy matcher can over-read previous-state text, so it is only used as a fallback.
+    const lane1Closed = lane1CurrentStatuses.length > 0
+      ? lane1CurrentStatuses.some(isCounterFlowClosedStatus)
+      : legacyLane1Closed;
+    const lane2Closed = lane2CurrentStatuses.length > 0
+      ? lane2CurrentStatuses.some(isCounterFlowClosedStatus)
+      : legacyLane2Closed;
     
     // Determine counter-flow configuration
     let status;
@@ -1282,6 +1292,11 @@ app.get('/api/counterflow/status', async (req, res) => {
       ), // healthy if checked within 5 minutes
       rawStatus: counterFlowData.currentStatus
     };
+
+    if (req.query.debug === '1') {
+      response.sourceUrl = BC_ATIS_URL;
+      response.parserDebug = counterFlowData.rawData || null;
+    }
     
     res.json(response);
   } catch (error) {
