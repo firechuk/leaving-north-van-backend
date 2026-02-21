@@ -171,6 +171,19 @@ function isLegacyIntervalIndexOnlyDefinition(definition) {
     return columns.length === 1 && columns[0] === 'interval_index';
 }
 
+function isLegacyIntervalIndexRangeCheck(definition) {
+    const normalized = String(definition || '').toLowerCase().replace(/\s+/g, ' ');
+    if (!normalized.includes('interval_index')) return false;
+    return (
+        normalized.includes('interval_index >= 0') &&
+        (
+            normalized.includes('interval_index < 720') ||
+            normalized.includes('interval_index <= 719') ||
+            normalized.includes('between 0 and 719')
+        )
+    );
+}
+
 function quoteIdentifier(identifier) {
     return `"${String(identifier).replace(/"/g, '""')}"`;
 }
@@ -197,6 +210,7 @@ class TrafficDatabase {
     async ensureTrafficSnapshotsConstraints() {
         const client = await this.pool.connect();
         const droppedLegacyConstraints = [];
+        const droppedLegacyCheckConstraints = [];
         const droppedLegacyIndexes = [];
 
         try {
@@ -233,6 +247,18 @@ class TrafficDatabase {
                 `);
             }
 
+            const checkConstraintsResult = await client.query(`
+                SELECT conname, pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conrelid = 'traffic_snapshots'::regclass
+                  AND contype = 'c';
+            `);
+            for (const row of checkConstraintsResult.rows) {
+                if (!isLegacyIntervalIndexRangeCheck(row.definition)) continue;
+                await client.query(`ALTER TABLE traffic_snapshots DROP CONSTRAINT IF EXISTS ${quoteIdentifier(row.conname)};`);
+                droppedLegacyCheckConstraints.push(row.conname);
+            }
+
             const uniqueIndexesResult = await client.query(`
                 SELECT indexname, indexdef
                 FROM pg_indexes
@@ -252,6 +278,7 @@ class TrafficDatabase {
             console.log(
                 `✅ DB constraint check complete: ` +
                 `dropped legacy constraints=${droppedLegacyConstraints.length}, ` +
+                `dropped legacy check constraints=${droppedLegacyCheckConstraints.length}, ` +
                 `dropped legacy indexes=${droppedLegacyIndexes.length}`
             );
         } catch (error) {
