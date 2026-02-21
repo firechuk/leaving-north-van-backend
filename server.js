@@ -24,6 +24,8 @@ const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 const TRAFFIC_TODAY_CACHE_TTL_MS = 20 * 1000;
+const TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS = 2;
+const TRAFFIC_TODAY_MAX_SERVICE_DAYS = 21;
 const MANUAL_TRACKED_SOURCE_IDS = new Set([
   'here-net-0dcfe4832adf37',
   'here-net-b9879cd7423d5d',
@@ -1066,7 +1068,13 @@ app.get('/health', (req, res) => {
 app.get('/api/traffic/today', async (req, res) => {
   try {
     let response;
-    const requestedServiceDays = Math.max(1, Math.min(7, Number.parseInt(req.query.serviceDays, 10) || 2));
+    const requestedServiceDays = Math.max(
+      1,
+      Math.min(
+        TRAFFIC_TODAY_MAX_SERVICE_DAYS,
+        Number.parseInt(req.query.serviceDays, 10) || TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS
+      )
+    );
     const refreshParam = String(req.query.refresh || '').toLowerCase();
     const bypassCache = refreshParam === '1' || refreshParam === 'true' || refreshParam === 'yes';
     const cacheKey = getTrafficTodayCacheKey(requestedServiceDays);

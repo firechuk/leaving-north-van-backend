@@ -4,6 +4,7 @@ const { Pool } = require('pg');
 const SERVICE_TIME_ZONE = 'America/Vancouver';
 const SERVICE_DAY_START_HOUR = 4;
 const SNAPSHOT_INTERVAL_MINUTES = 2;
+const MAX_SERVICE_DAYS = 21;
 
 const serviceTimePartsFormatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: SERVICE_TIME_ZONE,
@@ -313,7 +314,7 @@ class TrafficDatabase {
             if (this.readyPromise) {
                 await this.readyPromise;
             }
-            const normalizedServiceDays = Math.max(1, Math.min(7, Number(serviceDays) || 1));
+            const normalizedServiceDays = Math.max(1, Math.min(MAX_SERVICE_DAYS, Number(serviceDays) || 1));
             const { serviceDayKey, startUtc, endUtc } = getCurrentServiceDayWindow(new Date());
             const windowStartUtc = new Date(startUtc.getTime() - ((normalizedServiceDays - 1) * 24 * 60 * 60 * 1000));
             const windowStartIso = windowStartUtc.toISOString();
