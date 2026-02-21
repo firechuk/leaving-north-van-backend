@@ -217,7 +217,9 @@ class TrafficDatabase {
                 ADD CONSTRAINT traffic_snapshots_date_key_interval_index_key
                 UNIQUE (date_key, interval_index);
             `).catch((error) => {
-                if (error && error.code === '42710') return; // duplicate_object
+                // 42710: duplicate_object (constraint exists)
+                // 42P07: duplicate_table/relation (index backing the constraint already exists)
+                if (error && (error.code === '42710' || error.code === '42P07')) return;
                 throw error;
             });
 
