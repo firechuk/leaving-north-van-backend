@@ -23,6 +23,7 @@ const HERE_API_KEY = process.env.HERE_API_KEY || 'YOUR_HERE_API_KEY_NEEDED';
 const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
+const TRAFFIC_TODAY_CACHE_TTL_MS = 20 * 1000;
 const MANUAL_TRACKED_SOURCE_IDS = new Set([
   'here-net-0dcfe4832adf37',
   'here-net-b9879cd7423d5d',
@@ -126,6 +127,37 @@ let debugRouteSnapshot = {
   filterMode: 'none',
   manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
   manualTrackedMatchedCount: 0
+};
+
+let trafficTodayCache = {
+  key: null,
+  expiresAt: 0,
+  payload: null
+};
+
+const getTrafficTodayCacheKey = (serviceDays) => `serviceDays:${serviceDays}`;
+
+const getTrafficTodayCachePayload = (cacheKey) => {
+  if (!trafficTodayCache.payload) return null;
+  if (trafficTodayCache.key !== cacheKey) return null;
+  if (Date.now() >= trafficTodayCache.expiresAt) return null;
+  return trafficTodayCache.payload;
+};
+
+const setTrafficTodayCachePayload = (cacheKey, payload) => {
+  trafficTodayCache = {
+    key: cacheKey,
+    expiresAt: Date.now() + TRAFFIC_TODAY_CACHE_TTL_MS,
+    payload
+  };
+};
+
+const invalidateTrafficTodayCache = () => {
+  trafficTodayCache = {
+    key: null,
+    expiresAt: 0,
+    payload: null
+  };
 };
 
 const toFiniteNumber = (value) => {
@@ -892,6 +924,7 @@ const updateCounterFlowData = async () => {
   counterFlowData.lastChecked = newData.timestamp;
   counterFlowData.lanesOutbound = newData.lanesOutbound;
   counterFlowData.rawData = newData.rawData;
+  invalidateTrafficTodayCache();
 };
 
 // Collect traffic data
@@ -934,6 +967,7 @@ const collectTrafficData = async () => {
     if (trafficIntervals.length > 720) {
       trafficIntervals = trafficIntervals.slice(-720);
     }
+    invalidateTrafficTodayCache();
     
     // Save to database if available
     if (db) {
@@ -986,6 +1020,20 @@ app.get('/api/traffic/today', async (req, res) => {
   try {
     let response;
     const requestedServiceDays = Math.max(1, Math.min(7, Number.parseInt(req.query.serviceDays, 10) || 2));
+    const refreshParam = String(req.query.refresh || '').toLowerCase();
+    const bypassCache = refreshParam === '1' || refreshParam === 'true' || refreshParam === 'yes';
+    const cacheKey = getTrafficTodayCacheKey(requestedServiceDays);
+    if (!bypassCache) {
+      const cachedPayload = getTrafficTodayCachePayload(cacheKey);
+      if (cachedPayload) {
+        console.log(`📦 /api/traffic/today cache hit (${cacheKey})`);
+        res.set('X-Traffic-Cache', 'HIT');
+        res.json(cachedPayload);
+        return;
+      }
+    }
+    console.log(`📦 /api/traffic/today cache miss (${cacheKey}${bypassCache ? ', bypassed' : ''})`);
+    res.set('X-Traffic-Cache', 'MISS');
     
     // Try database first if available
     if (db) {
@@ -1052,6 +1100,7 @@ app.get('/api/traffic/today', async (req, res) => {
               memoryLatestIntervalAgeMs: memoryDataAgeMs
             };
             console.log(`✅ Served hybrid dataset: ${mergedIntervals.length} merged intervals (DB stale, memory tail appended)`);
+            setTrafficTodayCachePayload(cacheKey, response);
             res.json(response);
             return;
           } else {
@@ -1078,6 +1127,7 @@ app.get('/api/traffic/today', async (req, res) => {
               memoryLatestIntervalAgeMs: memoryDataAgeMs
             };
             console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
+            setTrafficTodayCachePayload(cacheKey, response);
             res.json(response);
             return;
           }
@@ -1133,6 +1183,7 @@ app.get('/api/traffic/today', async (req, res) => {
       latestIntervalAgeMs: memoryDataAgeMs
     };
     
+    setTrafficTodayCachePayload(cacheKey, response);
     res.json(response);
     
   } catch (error) {
