@@ -282,27 +282,54 @@ class TrafficDatabase {
                 counterFlowData,
                 timestamp: now.toISOString()
             };
-            
-            const query = `
-                INSERT INTO traffic_snapshots (observed_at, date_key, interval_index, raw_data)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (date_key, interval_index)
-                DO UPDATE SET
-                    observed_at = EXCLUDED.observed_at,
-                    raw_data = EXCLUDED.raw_data
-                RETURNING id;
-            `;
-            
+
             const values = [
                 now.toISOString(), // Convert Date to ISO string for TEXT column
                 dateKey,
                 intervalIndex, 
                 JSON.stringify(snapshotData)
             ];
-            
-            const result = await this.pool.query(query, values);
-            console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${result.rows[0].id})`);
-            return result.rows[0].id;
+
+            // Robust upsert that does not rely on ON CONFLICT index inference.
+            // This avoids silent persistence loss when legacy schema drift exists.
+            const updateQuery = `
+                UPDATE traffic_snapshots
+                SET observed_at = $1,
+                    raw_data = $4
+                WHERE date_key = $2
+                  AND interval_index = $3
+                RETURNING id;
+            `;
+            const updateResult = await this.pool.query(updateQuery, values);
+            if (updateResult.rows.length > 0) {
+                const updatedId = updateResult.rows[0].id;
+                console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${updatedId}, mode:update)`);
+                return updatedId;
+            }
+
+            const insertQuery = `
+                INSERT INTO traffic_snapshots (observed_at, date_key, interval_index, raw_data)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id;
+            `;
+
+            try {
+                const insertResult = await this.pool.query(insertQuery, values);
+                const insertedId = insertResult.rows[0].id;
+                console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${insertedId}, mode:insert)`);
+                return insertedId;
+            } catch (insertError) {
+                // Race-safe fallback when a concurrent writer inserts between update/insert.
+                if (insertError?.code === '23505') {
+                    const retryUpdateResult = await this.pool.query(updateQuery, values);
+                    if (retryUpdateResult.rows.length > 0) {
+                        const retryId = retryUpdateResult.rows[0].id;
+                        console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${retryId}, mode:retry-update)`);
+                        return retryId;
+                    }
+                }
+                throw insertError;
+            }
         } catch (error) {
             console.error('❌ Failed to save traffic snapshot:', error.message);
             console.error('❌ Full error details:', error);
