@@ -2,8 +2,10 @@
 const { Pool } = require('pg');
 
 const SERVICE_TIME_ZONE = 'America/Vancouver';
-const SERVICE_DAY_START_HOUR = 4;
+const SERVICE_DAY_START_HOUR = 0;
 const SNAPSHOT_INTERVAL_MINUTES = 2;
+// Cutover guard: keep legacy 4am-keyed rows and new midnight-keyed rows from colliding.
+const SERVICE_INTERVAL_INDEX_OFFSET = 720;
 const MAX_SERVICE_DAYS = 21;
 
 const serviceTimePartsFormatter = new Intl.DateTimeFormat('en-CA', {
@@ -132,7 +134,7 @@ function getServiceIntervalIndex(date = new Date()) {
     const totalMinutes = (parts.hour * 60) + parts.minute;
     const startMinutes = SERVICE_DAY_START_HOUR * 60;
     const minutesSinceStart = (totalMinutes - startMinutes + (24 * 60)) % (24 * 60);
-    return Math.floor(minutesSinceStart / SNAPSHOT_INTERVAL_MINUTES);
+    return Math.floor(minutesSinceStart / SNAPSHOT_INTERVAL_MINUTES) + SERVICE_INTERVAL_INDEX_OFFSET;
 }
 
 function normalizeObservedAtTimestamp(observedAt) {
@@ -413,7 +415,7 @@ class TrafficDatabase {
         }
     }
     
-    // Calculate 2-minute interval index within the service day (4am->4am, 0-719).
+    // Calculate 2-minute interval index within the service day (12am->12am, offset range 720-1439).
     calculateIntervalIndex(date) {
         return getServiceIntervalIndex(date);
     }
