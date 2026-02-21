@@ -728,6 +728,41 @@ const fetchHereTrafficData = async () => {
 // Lions Gate Bridge Counter-Flow Data Collection
 const BC_ATIS_URL = 'http://www.th.gov.bc.ca/ATIS/lgcws/private_status.htm';
 
+const extractVdsSection = (html, vdsId) => {
+  if (typeof html !== 'string' || !html) return null;
+  const escapedId = String(vdsId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(`VDS\\s*ID:\\s*${escapedId}\\b[\\s\\S]*?(?=VDS\\s*ID:|ATC\\s*ID:|$)`, 'i');
+  const match = html.match(regex);
+  return match ? match[0] : null;
+};
+
+const extractLaneSection = (vdsSection, laneNumber) => {
+  if (typeof vdsSection !== 'string' || !vdsSection) return null;
+  const laneId = String(laneNumber).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(
+    `Lane\\s*Number:\\s*${laneId}\\b[\\s\\S]*?(?=Lane\\s*Number:\\s*\\d+\\b|VDS\\s*ID:|ATC\\s*ID:|$)`,
+    'i'
+  );
+  const match = vdsSection.match(regex);
+  return match ? match[0] : null;
+};
+
+const parseCurrentLaneStatuses = (laneSection) => {
+  if (typeof laneSection !== 'string' || !laneSection) return [];
+  const statuses = [];
+  const regex = /Current\s+(?:Upstream|Downstream)\s+Loop\s+Status:\s*([^\r\n<]+)/gi;
+  let match;
+  while ((match = regex.exec(laneSection)) !== null) {
+    const statusText = String(match[1] || '').trim();
+    if (statusText) statuses.push(statusText);
+  }
+  return statuses;
+};
+
+const isCounterFlowClosedStatus = (statusText) => (
+  /counter[\s-]*flow\s+lane\s+is\s+closed/i.test(String(statusText || ''))
+);
+
 const scrapeCounterFlowData = async () => {
   try {
     console.log('🌉 Scraping Lions Gate counter-flow data...');
@@ -741,18 +776,27 @@ const scrapeCounterFlowData = async () => {
     
     // Parse HTML for VDS ID: 201 data
     const html = response.data;
-    const vds201Match = html.match(/VDS ID:\s*201[\s\S]*?(?=VDS ID:|$)/i);
-    
-    if (!vds201Match) {
+    const vds201Section = extractVdsSection(html, 201);
+
+    if (!vds201Section) {
       console.log('⚠️ Could not find VDS ID: 201 in response');
       return null;
     }
-    
-    const vds201Section = vds201Match[0];
-    
-    // Parse lane statuses
-    const lane1Closed = /Lane 1[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
-    const lane2Closed = /Lane 2[\s\S]*?COUNTER FLOW LANE IS CLOSED/i.test(vds201Section);
+
+    const lane1Section = extractLaneSection(vds201Section, 1);
+    const lane2Section = extractLaneSection(vds201Section, 2);
+    const lane1CurrentStatuses = parseCurrentLaneStatuses(lane1Section);
+    const lane2CurrentStatuses = parseCurrentLaneStatuses(lane2Section);
+
+    if (lane1CurrentStatuses.length === 0 || lane2CurrentStatuses.length === 0) {
+      console.log('⚠️ Could not parse current loop statuses for VDS 201 lanes');
+      return null;
+    }
+
+    // Determine lane closure from CURRENT statuses only.
+    // This avoids false positives from "Previous ... COUNTER FLOW LANE IS CLOSED".
+    const lane1Closed = lane1CurrentStatuses.some(isCounterFlowClosedStatus);
+    const lane2Closed = lane2CurrentStatuses.some(isCounterFlowClosedStatus);
     
     // Determine counter-flow configuration
     let status;
@@ -774,7 +818,10 @@ const scrapeCounterFlowData = async () => {
     
     const timestamp = new Date().toISOString();
     
-    console.log(`✅ Lions Gate status: ${status} (${lanesOutbound} lanes outbound)`);
+    console.log(
+      `✅ Lions Gate status: ${status} (${lanesOutbound} lanes outbound) ` +
+      `[lane1Closed=${lane1Closed}, lane2Closed=${lane2Closed}]`
+    );
     
     return {
       status,
@@ -783,6 +830,8 @@ const scrapeCounterFlowData = async () => {
       rawData: {
         lane1Closed,
         lane2Closed,
+        lane1CurrentStatuses,
+        lane2CurrentStatuses,
         vds201Section: vds201Section.substring(0, 500) // First 500 chars for debugging
       }
     };
@@ -799,11 +848,16 @@ const updateCounterFlowData = async () => {
   if (!newData) return; // Skip update if scraping failed
   
   const previousStatus = counterFlowData.currentStatus;
-  const statusChanged = previousStatus !== newData.status;
+  const previousLanesOutbound = Number(counterFlowData.lanesOutbound);
+  const statusChanged = previousStatus !== newData.status ||
+    previousLanesOutbound !== Number(newData.lanesOutbound);
   
   if (statusChanged) {
     // Log status change
-    console.log(`🔄 Counter-flow changed: ${previousStatus || 'unknown'} → ${newData.status}`);
+    console.log(
+      `🔄 Counter-flow changed: ${previousStatus || 'unknown'} (${Number.isFinite(previousLanesOutbound) ? previousLanesOutbound : '?'}) ` +
+      `→ ${newData.status} (${newData.lanesOutbound})`
+    );
     
     // Add to history
     counterFlowData.history.push({
@@ -1200,16 +1254,24 @@ app.get('/api/database/stats', async (req, res) => {
 app.get('/api/counterflow/status', async (req, res) => {
   try {
     const now = Date.now();
+    const parsedLanesOutbound = Number(counterFlowData.lanesOutbound);
+    const hasLanesOutbound = Number.isFinite(parsedLanesOutbound);
     const hasCounterflowStatus =
-      typeof counterFlowData.currentStatus === 'string' && counterFlowData.currentStatus.length > 0;
+      hasLanesOutbound ||
+      (typeof counterFlowData.currentStatus === 'string' && counterFlowData.currentStatus.length > 0);
+    const isActive = hasLanesOutbound
+      ? parsedLanesOutbound >= 2
+      : (hasCounterflowStatus ? counterFlowData.currentStatus === 'outbound-2' : null);
     const stateStartTime = counterFlowData.statusSince
       ? new Date(counterFlowData.statusSince).getTime()
       : null;
     const response = {
       hasData: hasCounterflowStatus,
-      isActive: hasCounterflowStatus ? counterFlowData.currentStatus === 'outbound-2' : null, // 2 lanes outbound = counterflow
+      isActive,
       status: counterFlowData.currentStatus,
-      lanesOutbound: hasCounterflowStatus ? (counterFlowData.lanesOutbound || 1) : null,
+      lanesOutbound: hasCounterflowStatus
+        ? (hasLanesOutbound ? parsedLanesOutbound : null)
+        : null,
       stateStartTime,
       currentDuration: stateStartTime ? now - stateStartTime : null,
       lastChecked: counterFlowData.lastChecked ? new Date(counterFlowData.lastChecked).getTime() : null,
