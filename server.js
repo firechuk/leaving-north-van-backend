@@ -24,8 +24,22 @@ const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 const TRAFFIC_TODAY_CACHE_TTL_MS = 60 * 1000;
+const TRAFFIC_TODAY_CACHE_MAX_KEYS = 8;
 const TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS = 2;
 const TRAFFIC_TODAY_MAX_SERVICE_DAYS = 21;
+const TRAFFIC_TODAY_ABSOLUTE_SAFE_MAX_SERVICE_DAYS = 3;
+const TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS || '2', 10);
+  if (!Number.isFinite(parsed)) return 2;
+  return Math.max(
+    1,
+    Math.min(
+      TRAFFIC_TODAY_MAX_SERVICE_DAYS,
+      TRAFFIC_TODAY_ABSOLUTE_SAFE_MAX_SERVICE_DAYS,
+      parsed
+    )
+  );
+})();
 const MANUAL_TRACKED_SOURCE_IDS = new Set([
   'here-net-0dcfe4832adf37',
   'here-net-b9879cd7423d5d',
@@ -133,36 +147,40 @@ let debugRouteSnapshot = {
   manualTrackedMatchedCount: 0
 };
 
-let trafficTodayCache = {
-  key: null,
-  expiresAt: 0,
-  payload: null
-};
+let trafficTodayCache = new Map();
 const trafficTodayInFlight = new Map();
 
 const getTrafficTodayCacheKey = (serviceDays) => `serviceDays:${serviceDays}`;
 
 const getTrafficTodayCachePayload = (cacheKey) => {
-  if (!trafficTodayCache.payload) return null;
-  if (trafficTodayCache.key !== cacheKey) return null;
-  if (Date.now() >= trafficTodayCache.expiresAt) return null;
-  return trafficTodayCache.payload;
+  const cacheEntry = trafficTodayCache.get(cacheKey);
+  if (!cacheEntry) return null;
+  if (Date.now() >= cacheEntry.expiresAt) {
+    trafficTodayCache.delete(cacheKey);
+    return null;
+  }
+  return cacheEntry.payload;
 };
 
 const setTrafficTodayCachePayload = (cacheKey, payload) => {
-  trafficTodayCache = {
-    key: cacheKey,
+  if (trafficTodayCache.has(cacheKey)) {
+    trafficTodayCache.delete(cacheKey);
+  }
+  trafficTodayCache.set(cacheKey, {
     expiresAt: Date.now() + TRAFFIC_TODAY_CACHE_TTL_MS,
     payload
-  };
+  });
+
+  // Keep a bounded cache so serviceDays variants do not evict each other instantly.
+  while (trafficTodayCache.size > TRAFFIC_TODAY_CACHE_MAX_KEYS) {
+    const oldestKey = trafficTodayCache.keys().next().value;
+    if (!oldestKey) break;
+    trafficTodayCache.delete(oldestKey);
+  }
 };
 
 const invalidateTrafficTodayCache = () => {
-  trafficTodayCache = {
-    key: null,
-    expiresAt: 0,
-    payload: null
-  };
+  trafficTodayCache.clear();
 };
 
 const toFiniteNumber = (value) => {
@@ -1216,7 +1234,6 @@ const updateCounterFlowData = async () => {
   counterFlowData.rawData = newData.rawData;
   counterFlowData.lastError = null;
   counterFlowData.sourceUrl = newData.sourceUrlUsed || counterFlowData.sourceUrl || null;
-  invalidateTrafficTodayCache();
 };
 
 const bootstrapCounterFlowFromDatabase = async () => {
@@ -1339,13 +1356,23 @@ app.get('/health', (req, res) => {
 app.get('/api/traffic/today', async (req, res) => {
   try {
     let response;
-    const requestedServiceDays = Math.max(
+    const requestedServiceDaysRaw = Math.max(
       1,
       Math.min(
         TRAFFIC_TODAY_MAX_SERVICE_DAYS,
         Number.parseInt(req.query.serviceDays, 10) || TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS
       )
     );
+    const requestedServiceDays = Math.min(
+      TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS,
+      requestedServiceDaysRaw
+    );
+    if (requestedServiceDays !== requestedServiceDaysRaw) {
+      console.warn(
+        `⚠️ /api/traffic/today requested serviceDays=${requestedServiceDaysRaw} ` +
+        `capped to ${requestedServiceDays} (runtime safe max ${TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS})`
+      );
+    }
     const refreshParam = String(req.query.refresh || '').toLowerCase();
     const bypassCache = refreshParam === '1' || refreshParam === 'true' || refreshParam === 'yes';
     const cacheKey = getTrafficTodayCacheKey(requestedServiceDays);
