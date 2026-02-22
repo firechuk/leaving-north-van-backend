@@ -811,24 +811,22 @@ const parseCurrentLaneStatuses = (laneSection) => {
   if (!plainText) return [];
 
   const statuses = [];
-  const regex = /Current\s+(?:Upstream|Downstream)\s+Loop\s+Status\s*:?\s*([^\r\n]+)/gi;
-  let match;
-  while ((match = regex.exec(plainText)) !== null) {
-    const statusText = String(match[1] || '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (statusText) statuses.push(statusText);
-  }
+  const patterns = [
+    /Current\s+(?:Upstream|Downstream)\s+Loop\s+Status\s*:?\s*([^\r\n]+)/gi,
+    /Current\s+(?:Upstream|Downstream)\s+Lane\s+Status\s*:?\s*([^\r\n]+)/gi,
+    /Current\s+(?:Upstream|Downstream)\s+Status\s*:?\s*([^\r\n]+)/gi,
+    /(?:Upstream|Downstream)\s+Current\s+Status\s*:?\s*([^\r\n]+)/gi
+  ];
 
-  if (statuses.length === 0) {
-    const fallbackRegex = /Current\s+(?:Upstream|Downstream)\s+Status\s*:?\s*([^\r\n]+)/gi;
-    while ((match = fallbackRegex.exec(plainText)) !== null) {
+  patterns.forEach((regex) => {
+    let match;
+    while ((match = regex.exec(plainText)) !== null) {
       const statusText = String(match[1] || '')
         .replace(/\s+/g, ' ')
         .trim();
       if (statusText) statuses.push(statusText);
     }
-  }
+  });
 
   return statuses;
 };
@@ -844,16 +842,101 @@ const classifyLaneClosedFromStatus = (statusText) => {
   return null;
 };
 
-const resolveLaneClosed = (statuses = []) => {
-  const classifications = statuses
-    .map((status) => classifyLaneClosedFromStatus(status))
-    .filter((value) => typeof value === 'boolean');
-  if (classifications.length === 0) return null;
+const extractLaneSectionFromPlainText = (vdsSection, laneNumber) => {
+  const plainText = htmlToPlainText(vdsSection);
+  if (!plainText) return null;
+  const laneId = String(laneNumber).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(
+    `Lane(?:\\s*Number)?\\s*[:#-]?\\s*${laneId}\\b[\\s\\S]*?(?=Lane(?:\\s*Number)?\\s*[:#-]?\\s*\\d+\\b|VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`,
+    'i'
+  );
+  const match = plainText.match(regex);
+  return match ? match[0] : null;
+};
 
-  const hasClosed = classifications.includes(true);
-  const hasOpen = classifications.includes(false);
-  if (hasClosed && hasOpen) return null;
-  return hasClosed;
+const parseLaneTelemetryMetrics = (laneSection) => {
+  const plainText = htmlToPlainText(laneSection);
+  if (!plainText) {
+    return {
+      averagedSpeeds: [],
+      loopVolumes: []
+    };
+  }
+
+  const averagedSpeeds = [];
+  const speedRegex = /Last\s+Averaged\s+Lane\s+Data\s*:\s*Speed\s*=\s*(-?\d+(?:\.\d+)?)/gi;
+  let match;
+  while ((match = speedRegex.exec(plainText)) !== null) {
+    const speed = Number(match[1]);
+    if (Number.isFinite(speed)) averagedSpeeds.push(speed);
+  }
+
+  const loopVolumes = [];
+  const volumeRegex = /Last\s+(?:Upstream|Downstream)\s+Loop\s+Data\s*:\s*Volume\s*=\s*(-?\d+(?:\.\d+)?)/gi;
+  while ((match = volumeRegex.exec(plainText)) !== null) {
+    const volume = Number(match[1]);
+    if (Number.isFinite(volume)) loopVolumes.push(volume);
+  }
+
+  return {
+    averagedSpeeds,
+    loopVolumes
+  };
+};
+
+const resolveLaneClosedFromSection = (laneSection) => {
+  if (typeof laneSection !== 'string' || !laneSection) return null;
+
+  const statuses = parseCurrentLaneStatuses(laneSection);
+  const metrics = parseLaneTelemetryMetrics(laneSection);
+  let closedScore = 0;
+  let openScore = 0;
+
+  statuses.forEach((statusText) => {
+    const classified = classifyLaneClosedFromStatus(statusText);
+    if (classified === true) {
+      closedScore += /counter[\s-]*flow.*closed/i.test(statusText) ? 3 : 2;
+    } else if (classified === false) {
+      openScore += /counter[\s-]*flow.*open/i.test(statusText) ? 3 : 2;
+    }
+  });
+
+  if (metrics.averagedSpeeds.some((value) => value === -1)) {
+    closedScore += 2;
+  } else if (metrics.averagedSpeeds.some((value) => value >= 0)) {
+    openScore += 1;
+  }
+
+  if (metrics.loopVolumes.length > 0) {
+    if (metrics.loopVolumes.every((value) => value === -1)) {
+      closedScore += 1;
+    } else if (metrics.loopVolumes.some((value) => value >= 0)) {
+      openScore += 1;
+    }
+  }
+
+  if (closedScore === 0 && openScore === 0) return null;
+  if (closedScore === openScore) return null;
+  return closedScore > openScore;
+};
+
+const resolveLaneClosedAcrossSensors = (laneStates = [], fallbackValue = null) => {
+  const resolved = laneStates.filter((value) => typeof value === 'boolean');
+  if (resolved.length === 0) {
+    return typeof fallbackValue === 'boolean' ? fallbackValue : null;
+  }
+
+  let closedCount = 0;
+  let openCount = 0;
+  resolved.forEach((value) => {
+    if (value) closedCount += 1;
+    else openCount += 1;
+  });
+
+  if (closedCount > openCount) return true;
+  if (openCount > closedCount) return false;
+  if (typeof fallbackValue === 'boolean') return fallbackValue;
+  return resolved[0];
 };
 
 const scrapeCounterFlowData = async () => {
@@ -876,14 +959,51 @@ const scrapeCounterFlowData = async () => {
       return null;
     }
 
-    const lane1Section = extractLaneSection(vds201Section, 1);
-    const lane2Section = extractLaneSection(vds201Section, 2);
-    const lane1CurrentStatuses = parseCurrentLaneStatuses(lane1Section);
-    const lane2CurrentStatuses = parseCurrentLaneStatuses(lane2Section);
-    const lane1Closed = resolveLaneClosed(lane1CurrentStatuses);
-    const lane2Closed = resolveLaneClosed(lane2CurrentStatuses);
+    const vds202Section = extractVdsSection(html, 202);
+    const sensorSections = [
+      { id: 201, section: vds201Section },
+      { id: 202, section: vds202Section }
+    ].filter((entry) => typeof entry.section === 'string' && entry.section.length > 0);
+
+    const previousLane1Closed = typeof counterFlowData?.rawData?.lane1Closed === 'boolean'
+      ? counterFlowData.rawData.lane1Closed
+      : null;
+    const previousLane2Closed = typeof counterFlowData?.rawData?.lane2Closed === 'boolean'
+      ? counterFlowData.rawData.lane2Closed
+      : null;
+
+    const sensorDebug = sensorSections.map((entry) => {
+      const lane1Section =
+        extractLaneSection(entry.section, 1) ||
+        extractLaneSectionFromPlainText(entry.section, 1);
+      const lane2Section =
+        extractLaneSection(entry.section, 2) ||
+        extractLaneSectionFromPlainText(entry.section, 2);
+      const lane1CurrentStatuses = parseCurrentLaneStatuses(lane1Section);
+      const lane2CurrentStatuses = parseCurrentLaneStatuses(lane2Section);
+      const lane1Closed = resolveLaneClosedFromSection(lane1Section);
+      const lane2Closed = resolveLaneClosedFromSection(lane2Section);
+      return {
+        vdsId: entry.id,
+        lane1Closed,
+        lane2Closed,
+        lane1CurrentStatuses,
+        lane2CurrentStatuses,
+        lane1SectionPreview: String(lane1Section || '').substring(0, 220),
+        lane2SectionPreview: String(lane2Section || '').substring(0, 220)
+      };
+    });
+
+    const lane1Closed = resolveLaneClosedAcrossSensors(
+      sensorDebug.map((entry) => entry.lane1Closed),
+      previousLane1Closed
+    );
+    const lane2Closed = resolveLaneClosedAcrossSensors(
+      sensorDebug.map((entry) => entry.lane2Closed),
+      previousLane2Closed
+    );
     if (lane1Closed === null || lane2Closed === null) {
-      console.log('⚠️ Could not reliably resolve current lane states for VDS 201; skipping update');
+      console.log('⚠️ Could not reliably resolve current lane states for VDS 201/202; skipping update');
       return null;
     }
     
@@ -919,11 +1039,9 @@ const scrapeCounterFlowData = async () => {
       rawData: {
         lane1Closed,
         lane2Closed,
-        lane1CurrentStatuses,
-        lane2CurrentStatuses,
-        lane1SectionPreview: String(lane1Section || '').substring(0, 220),
-        lane2SectionPreview: String(lane2Section || '').substring(0, 220),
-        vds201Section: vds201Section.substring(0, 500) // First 500 chars for debugging
+        sensorDebug,
+        vds201Section: vds201Section.substring(0, 500), // First 500 chars for debugging
+        vds202Section: typeof vds202Section === 'string' ? vds202Section.substring(0, 500) : null
       }
     };
     
