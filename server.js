@@ -23,7 +23,7 @@ const HERE_API_KEY = process.env.HERE_API_KEY || 'YOUR_HERE_API_KEY_NEEDED';
 const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
-const TRAFFIC_TODAY_CACHE_TTL_MS = 20 * 1000;
+const TRAFFIC_TODAY_CACHE_TTL_MS = 60 * 1000;
 const TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS = 2;
 const TRAFFIC_TODAY_MAX_SERVICE_DAYS = 21;
 const MANUAL_TRACKED_SOURCE_IDS = new Set([
@@ -138,6 +138,7 @@ let trafficTodayCache = {
   expiresAt: 0,
   payload: null
 };
+const trafficTodayInFlight = new Map();
 
 const getTrafficTodayCacheKey = (serviceDays) => `serviceDays:${serviceDays}`;
 
@@ -1359,157 +1360,190 @@ app.get('/api/traffic/today', async (req, res) => {
     }
     console.log(`📦 /api/traffic/today cache miss (${cacheKey}${bypassCache ? ', bypassed' : ''})`);
     res.set('X-Traffic-Cache', 'MISS');
-    
-    // Try database first if available
-    if (db) {
-      console.log(`📊 API Request: /api/traffic/today - checking database...`);
-      try {
-        const latestMemoryIntervalMs = getLatestIntervalTimestampMs(trafficIntervals);
-        const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
-          ? Math.max(0, Date.now() - latestMemoryIntervalMs)
-          : null;
-        const dbData = await db.getTodayTrafficData(requestedServiceDays);
-        console.log(`🔍 DB data received: intervals=${dbData?.intervals?.length || 0}, segments=${Object.keys(dbData?.segments || {}).length}`);
-        
-        if (dbData && dbData.intervals.length > 0) {
-          const latestDbIntervalMs = getLatestIntervalTimestampMs(dbData.intervals);
-          const dbDataAgeMs = Number.isFinite(latestDbIntervalMs)
-            ? Math.max(0, Date.now() - latestDbIntervalMs)
-            : Number.POSITIVE_INFINITY;
-          const isDbFreshEnough = dbDataAgeMs <= TRAFFIC_DB_STALE_MAX_AGE_MS;
-          const latestDbInterval = getLatestTimestampedInterval(dbData.intervals);
-          const latestMemoryInterval = getLatestTimestampedInterval(trafficIntervals);
-          const canMergeDbAndMemory = areIntervalSchemasCompatible(latestDbInterval, latestMemoryInterval);
-
-          if (!isDbFreshEnough) {
-            console.warn(
-              `⚠️ DB data is stale (age ${Math.round(dbDataAgeMs / 1000)}s, threshold ${Math.round(TRAFFIC_DB_STALE_MAX_AGE_MS / 1000)}s). Serving hybrid DB+memory response.`
-            );
-            if (!canMergeDbAndMemory) {
-              console.warn('⚠️ DB and memory interval schemas appear different; merging by timestamp with unioned segment metadata.');
-            }
-            const mergedIntervals = mergeIntervalsByTimestamp(dbData.intervals, trafficIntervals);
-            const mergedLatestMs = getLatestIntervalTimestampMs(mergedIntervals);
-            const mergedAgeMs = Number.isFinite(mergedLatestMs)
-              ? Math.max(0, Date.now() - mergedLatestMs)
-              : null;
-            const mergedSegments = {
-              ...(dbData.segments || {}),
-              ...(segmentData || {})
-            };
-            const mergedSegmentCount = Object.keys(mergedSegments).length;
-            response = {
-              intervals: mergedIntervals,
-              segments: mergedSegments,
-              totalSegments: mergedSegmentCount,
-              currentIntervalIndex: mergedIntervals.length - 1,
-              maxInterval: mergedIntervals.length - 1,
-              coverage: `North Vancouver comprehensive: ${mergedSegmentCount} segments across ${NORTH_VAN_ROADS.length} major roads`,
-              dataSource: canMergeDbAndMemory ? 'hybrid-db-memory' : 'hybrid-db-memory-incompatible',
-              counterFlow: {
-                status: counterFlowData.currentStatus ?? dbData.counterFlow?.currentStatus,
-                lanesOutbound: counterFlowData.lanesOutbound || dbData.counterFlow?.lanesOutbound || 1,
-                statusSince: counterFlowData.statusSince || dbData.counterFlow?.statusSince,
-                lastChecked: counterFlowData.lastChecked || dbData.counterFlow?.lastChecked,
-                durationMs: (counterFlowData.statusSince || dbData.counterFlow?.statusSince)
-                  ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
-                  : null
-              },
-              fromDatabase: true,
-              fromMemory: true,
-              serviceDays: requestedServiceDays,
-              schemaCompatible: canMergeDbAndMemory,
-              dbRecordCount: dbData.recordCount,
-              latestIntervalAgeMs: mergedAgeMs,
-              dbLatestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
-              memoryLatestIntervalAgeMs: memoryDataAgeMs
-            };
-            console.log(`✅ Served hybrid dataset: ${mergedIntervals.length} merged intervals (DB stale, memory tail appended)`);
-            setTrafficTodayCachePayload(cacheKey, response);
-            res.json(response);
-            return;
-          } else {
-            response = {
-              intervals: dbData.intervals,
-              segments: dbData.segments,
-              totalSegments: Object.keys(dbData.segments).length,
-              currentIntervalIndex: dbData.intervals.length - 1,
-              maxInterval: dbData.intervals.length - 1,
-              coverage: `North Vancouver comprehensive: ${Object.keys(dbData.segments).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
-              dataSource: 'database-persistent',
-              counterFlow: {
-                status: dbData.counterFlow.currentStatus,
-                lanesOutbound: dbData.counterFlow.lanesOutbound || 1,
-                statusSince: dbData.counterFlow.statusSince,
-                lastChecked: dbData.counterFlow.lastChecked,
-                durationMs: dbData.counterFlow.statusSince ? 
-                  Date.now() - new Date(dbData.counterFlow.statusSince).getTime() : null
-              },
-              fromDatabase: true,
-              serviceDays: requestedServiceDays,
-              dbRecordCount: dbData.recordCount,
-              latestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
-              memoryLatestIntervalAgeMs: memoryDataAgeMs
-            };
-            console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
-            setTrafficTodayCachePayload(cacheKey, response);
-            res.json(response);
-            return;
-          }
-        } else {
-          console.log('📊 No database data found (empty intervals), falling back to memory...');
+    let inFlightGate = null;
+    if (!bypassCache) {
+      const existingInFlight = trafficTodayInFlight.get(cacheKey);
+      if (existingInFlight && existingInFlight.promise) {
+        console.log(`⏳ /api/traffic/today waiting for in-flight fetch (${cacheKey})`);
+        try {
+          await existingInFlight.promise;
+        } catch (_error) {
+          // Ignore gate wait errors and proceed to fresh read below.
         }
-      } catch (dbError) {
-        console.error('❌ Database read error, falling back to memory:', dbError.message);
-        console.error('❌ Full database read error:', dbError);
+        const waitedCachePayload = getTrafficTodayCachePayload(cacheKey);
+        if (waitedCachePayload) {
+          console.log(`📦 /api/traffic/today in-flight cache hit (${cacheKey})`);
+          res.set('X-Traffic-Cache', 'WAIT-HIT');
+          res.json(waitedCachePayload);
+          return;
+        }
+      }
+
+      let resolveGate;
+      const gatePromise = new Promise((resolve) => {
+        resolveGate = resolve;
+      });
+      inFlightGate = { promise: gatePromise, resolve: resolveGate };
+      trafficTodayInFlight.set(cacheKey, inFlightGate);
+    }
+
+    try {
+      // Try database first if available
+      if (db) {
+        console.log(`📊 API Request: /api/traffic/today - checking database...`);
+        try {
+          const latestMemoryIntervalMs = getLatestIntervalTimestampMs(trafficIntervals);
+          const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
+            ? Math.max(0, Date.now() - latestMemoryIntervalMs)
+            : null;
+          const dbData = await db.getTodayTrafficData(requestedServiceDays);
+          console.log(`🔍 DB data received: intervals=${dbData?.intervals?.length || 0}, segments=${Object.keys(dbData?.segments || {}).length}`);
+          
+          if (dbData && dbData.intervals.length > 0) {
+            const latestDbIntervalMs = getLatestIntervalTimestampMs(dbData.intervals);
+            const dbDataAgeMs = Number.isFinite(latestDbIntervalMs)
+              ? Math.max(0, Date.now() - latestDbIntervalMs)
+              : Number.POSITIVE_INFINITY;
+            const isDbFreshEnough = dbDataAgeMs <= TRAFFIC_DB_STALE_MAX_AGE_MS;
+            const latestDbInterval = getLatestTimestampedInterval(dbData.intervals);
+            const latestMemoryInterval = getLatestTimestampedInterval(trafficIntervals);
+            const canMergeDbAndMemory = areIntervalSchemasCompatible(latestDbInterval, latestMemoryInterval);
+
+            if (!isDbFreshEnough) {
+              console.warn(
+                `⚠️ DB data is stale (age ${Math.round(dbDataAgeMs / 1000)}s, threshold ${Math.round(TRAFFIC_DB_STALE_MAX_AGE_MS / 1000)}s). Serving hybrid DB+memory response.`
+              );
+              if (!canMergeDbAndMemory) {
+                console.warn('⚠️ DB and memory interval schemas appear different; merging by timestamp with unioned segment metadata.');
+              }
+              const mergedIntervals = mergeIntervalsByTimestamp(dbData.intervals, trafficIntervals);
+              const mergedLatestMs = getLatestIntervalTimestampMs(mergedIntervals);
+              const mergedAgeMs = Number.isFinite(mergedLatestMs)
+                ? Math.max(0, Date.now() - mergedLatestMs)
+                : null;
+              const mergedSegments = {
+                ...(dbData.segments || {}),
+                ...(segmentData || {})
+              };
+              const mergedSegmentCount = Object.keys(mergedSegments).length;
+              response = {
+                intervals: mergedIntervals,
+                segments: mergedSegments,
+                totalSegments: mergedSegmentCount,
+                currentIntervalIndex: mergedIntervals.length - 1,
+                maxInterval: mergedIntervals.length - 1,
+                coverage: `North Vancouver comprehensive: ${mergedSegmentCount} segments across ${NORTH_VAN_ROADS.length} major roads`,
+                dataSource: canMergeDbAndMemory ? 'hybrid-db-memory' : 'hybrid-db-memory-incompatible',
+                counterFlow: {
+                  status: counterFlowData.currentStatus ?? dbData.counterFlow?.currentStatus,
+                  lanesOutbound: counterFlowData.lanesOutbound || dbData.counterFlow?.lanesOutbound || 1,
+                  statusSince: counterFlowData.statusSince || dbData.counterFlow?.statusSince,
+                  lastChecked: counterFlowData.lastChecked || dbData.counterFlow?.lastChecked,
+                  durationMs: (counterFlowData.statusSince || dbData.counterFlow?.statusSince)
+                    ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
+                    : null
+                },
+                fromDatabase: true,
+                fromMemory: true,
+                serviceDays: requestedServiceDays,
+                schemaCompatible: canMergeDbAndMemory,
+                dbRecordCount: dbData.recordCount,
+                latestIntervalAgeMs: mergedAgeMs,
+                dbLatestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
+                memoryLatestIntervalAgeMs: memoryDataAgeMs
+              };
+              console.log(`✅ Served hybrid dataset: ${mergedIntervals.length} merged intervals (DB stale, memory tail appended)`);
+              setTrafficTodayCachePayload(cacheKey, response);
+              res.json(response);
+              return;
+            } else {
+              response = {
+                intervals: dbData.intervals,
+                segments: dbData.segments,
+                totalSegments: Object.keys(dbData.segments).length,
+                currentIntervalIndex: dbData.intervals.length - 1,
+                maxInterval: dbData.intervals.length - 1,
+                coverage: `North Vancouver comprehensive: ${Object.keys(dbData.segments).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
+                dataSource: 'database-persistent',
+                counterFlow: {
+                  status: dbData.counterFlow.currentStatus,
+                  lanesOutbound: dbData.counterFlow.lanesOutbound || 1,
+                  statusSince: dbData.counterFlow.statusSince,
+                  lastChecked: dbData.counterFlow.lastChecked,
+                  durationMs: dbData.counterFlow.statusSince ? 
+                    Date.now() - new Date(dbData.counterFlow.statusSince).getTime() : null
+                },
+                fromDatabase: true,
+                serviceDays: requestedServiceDays,
+                dbRecordCount: dbData.recordCount,
+                latestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
+                memoryLatestIntervalAgeMs: memoryDataAgeMs
+              };
+              console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
+              setTrafficTodayCachePayload(cacheKey, response);
+              res.json(response);
+              return;
+            }
+          } else {
+            console.log('📊 No database data found (empty intervals), falling back to memory...');
+          }
+        } catch (dbError) {
+          console.error('❌ Database read error, falling back to memory:', dbError.message);
+          console.error('❌ Full database read error:', dbError);
+        }
+      }
+      
+      // Fallback to memory storage
+      console.log(`📊 API Request: /api/traffic/today - ${trafficIntervals.length} intervals available in memory`);
+      
+      // If no data, collect some now
+      if (trafficIntervals.length === 0) {
+        await collectTrafficData();
+      }
+
+      const latestMemoryIntervalMs = getLatestIntervalTimestampMs(trafficIntervals);
+      const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
+        ? Math.max(0, Date.now() - latestMemoryIntervalMs)
+        : null;
+      
+      if (memoryDataAgeMs !== null && memoryDataAgeMs > TRAFFIC_DB_STALE_MAX_AGE_MS) {
+        console.warn(`⚠️ Memory traffic data appears stale (${Math.round(memoryDataAgeMs / 1000)}s old).`);
+      }
+      
+      const memorySegments = trafficIntervals.length > 0 ? segmentData : {};
+      const memorySegmentCount = Object.keys(memorySegments).length;
+
+      response = {
+        intervals: trafficIntervals,
+        segments: memorySegments,
+        totalSegments: memorySegmentCount,
+        currentIntervalIndex: trafficIntervals.length - 1,
+        maxInterval: trafficIntervals.length - 1,
+        coverage: memorySegmentCount > 0
+          ? `North Vancouver comprehensive: ${memorySegmentCount} segments across ${NORTH_VAN_ROADS.length} major roads`
+          : 'No live traffic data available',
+        dataSource: trafficIntervals.length > 0 ? 'memory-ephemeral' : 'no-live-data',
+        counterFlow: {
+          status: counterFlowData.currentStatus,
+          lanesOutbound: counterFlowData.lanesOutbound || 1,
+          statusSince: counterFlowData.statusSince,
+          lastChecked: counterFlowData.lastChecked,
+          durationMs: counterFlowData.statusSince ? 
+            Date.now() - new Date(counterFlowData.statusSince).getTime() : null
+        },
+        fromDatabase: false,
+        serviceDays: requestedServiceDays,
+        latestIntervalAgeMs: memoryDataAgeMs
+      };
+      
+      setTrafficTodayCachePayload(cacheKey, response);
+      res.json(response);
+    } finally {
+      if (inFlightGate && trafficTodayInFlight.get(cacheKey) === inFlightGate) {
+        inFlightGate.resolve();
+        trafficTodayInFlight.delete(cacheKey);
       }
     }
-    
-    // Fallback to memory storage
-    console.log(`📊 API Request: /api/traffic/today - ${trafficIntervals.length} intervals available in memory`);
-    
-    // If no data, collect some now
-    if (trafficIntervals.length === 0) {
-      await collectTrafficData();
-    }
-
-    const latestMemoryIntervalMs = getLatestIntervalTimestampMs(trafficIntervals);
-    const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
-      ? Math.max(0, Date.now() - latestMemoryIntervalMs)
-      : null;
-    
-    if (memoryDataAgeMs !== null && memoryDataAgeMs > TRAFFIC_DB_STALE_MAX_AGE_MS) {
-      console.warn(`⚠️ Memory traffic data appears stale (${Math.round(memoryDataAgeMs / 1000)}s old).`);
-    }
-    
-    const memorySegments = trafficIntervals.length > 0 ? segmentData : {};
-    const memorySegmentCount = Object.keys(memorySegments).length;
-
-    response = {
-      intervals: trafficIntervals,
-      segments: memorySegments,
-      totalSegments: memorySegmentCount,
-      currentIntervalIndex: trafficIntervals.length - 1,
-      maxInterval: trafficIntervals.length - 1,
-      coverage: memorySegmentCount > 0
-        ? `North Vancouver comprehensive: ${memorySegmentCount} segments across ${NORTH_VAN_ROADS.length} major roads`
-        : 'No live traffic data available',
-      dataSource: trafficIntervals.length > 0 ? 'memory-ephemeral' : 'no-live-data',
-      counterFlow: {
-        status: counterFlowData.currentStatus,
-        lanesOutbound: counterFlowData.lanesOutbound || 1,
-        statusSince: counterFlowData.statusSince,
-        lastChecked: counterFlowData.lastChecked,
-        durationMs: counterFlowData.statusSince ? 
-          Date.now() - new Date(counterFlowData.statusSince).getTime() : null
-      },
-      fromDatabase: false,
-      serviceDays: requestedServiceDays,
-      latestIntervalAgeMs: memoryDataAgeMs
-    };
-    
-    setTrafficTodayCachePayload(cacheKey, response);
-    res.json(response);
     
   } catch (error) {
     console.error('❌ Error in /api/traffic/today:', error);
@@ -1712,6 +1746,16 @@ const startServer = async () => {
   
   // Collect every 2 minutes
   setInterval(collectTrafficData, 2 * 60 * 1000);
+
+  // Lightweight memory heartbeat for crash triage on Railway.
+  setInterval(() => {
+    const usage = process.memoryUsage();
+    const toMb = (bytes) => Math.round((bytes / (1024 * 1024)) * 10) / 10;
+    console.log(
+      `🧠 Memory rss=${toMb(usage.rss)}MB heapUsed=${toMb(usage.heapUsed)}MB ` +
+      `heapTotal=${toMb(usage.heapTotal)}MB ext=${toMb(usage.external)}MB`
+    );
+  }, 5 * 60 * 1000);
   
   // Prime counter-flow state from latest persisted snapshot when available.
   await bootstrapCounterFlowFromDatabase();
