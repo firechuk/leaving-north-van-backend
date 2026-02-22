@@ -371,10 +371,24 @@ class TrafficDatabase {
                 await this.readyPromise;
             }
             const normalizedServiceDays = Math.max(1, Math.min(MAX_SERVICE_DAYS, Number(serviceDays) || 1));
-            const { serviceDayKey, startUtc, endUtc } = getCurrentServiceDayWindow(new Date());
-            const windowStartUtc = new Date(startUtc.getTime() - ((normalizedServiceDays - 1) * 24 * 60 * 60 * 1000));
+            const now = new Date();
+            const { serviceDayKey, endUtc } = getCurrentServiceDayWindow(now);
+            let queryEndUtc = endUtc;
+            if (!queryEndUtc || !Number.isFinite(queryEndUtc.getTime()) || queryEndUtc.getTime() <= now.getTime()) {
+                const fallbackEndUtc = new Date(now.getTime() + (2 * 60 * 1000));
+                const computedEndIso = queryEndUtc && Number.isFinite(queryEndUtc.getTime())
+                    ? queryEndUtc.toISOString()
+                    : 'invalid';
+                console.warn(
+                    `⚠️ DB READ: computed service window end ${computedEndIso} is not ahead of now ${now.toISOString()}; ` +
+                    `using rolling end ${fallbackEndUtc.toISOString()}`
+                );
+                queryEndUtc = fallbackEndUtc;
+            }
+
+            const windowStartUtc = new Date(queryEndUtc.getTime() - (normalizedServiceDays * 24 * 60 * 60 * 1000));
             const windowStartIso = windowStartUtc.toISOString();
-            const endIso = endUtc.toISOString();
+            const endIso = queryEndUtc.toISOString();
             console.log(
                 `🔍 DB READ: Querying ${normalizedServiceDays} service day(s) ending ${serviceDayKey} (` +
                 `${windowStartIso} → ${endIso}, ${SERVICE_TIME_ZONE}, ${SERVICE_DAY_START_HOUR}:00 start)`
