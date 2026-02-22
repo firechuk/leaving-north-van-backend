@@ -114,7 +114,9 @@ let counterFlowData = {
   currentStatus: null, // 'outbound-1', 'outbound-2', etc.
   statusSince: null, // timestamp when current status started
   lastChecked: null, // last scrape timestamp
-  history: [] // array of status changes for pattern analysis
+  history: [], // array of status changes for pattern analysis
+  lastError: null,
+  sourceUrl: null
 };
 
 // Debug route overlay cache (all routes + tracked overlay)
@@ -761,6 +763,10 @@ const fetchHereTrafficData = async () => {
 
 // Lions Gate Bridge Counter-Flow Data Collection
 const BC_ATIS_URL = 'http://www.th.gov.bc.ca/ATIS/lgcws/private_status.htm';
+const BC_ATIS_SOURCE_URLS = [
+  BC_ATIS_URL,
+  'https://www.th.gov.bc.ca/ATIS/lgcws/private_status.htm'
+];
 
 const extractVdsSection = (html, vdsId) => {
   if (typeof html !== 'string' || !html) return null;
@@ -939,31 +945,67 @@ const resolveLaneClosedAcrossSensors = (laneStates = [], fallbackValue = null) =
   return resolved[0];
 };
 
+const recordCounterFlowFailure = (reason, timestamp = new Date().toISOString(), rawData = null) => {
+  counterFlowData.lastChecked = timestamp;
+  counterFlowData.lastError = reason;
+  if (rawData) {
+    counterFlowData.rawData = {
+      ...(counterFlowData.rawData || {}),
+      failure: rawData
+    };
+  }
+};
+
 const scrapeCounterFlowData = async () => {
   try {
     console.log('🌉 Scraping Lions Gate counter-flow data...');
-    
-    const response = await axios.get(BC_ATIS_URL, {
-      timeout: 10000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; TrafficMonitor/1.0)'
+    let html = null;
+    let sourceUrlUsed = null;
+    const fetchErrors = [];
+    for (const candidateUrl of BC_ATIS_SOURCE_URLS) {
+      try {
+        const response = await axios.get(candidateUrl, {
+          timeout: 10000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; TrafficMonitor/1.0)'
+          }
+        });
+        const candidateHtml = typeof response?.data === 'string'
+          ? response.data
+          : String(response?.data || '');
+        if (candidateHtml.trim()) {
+          html = candidateHtml;
+          sourceUrlUsed = candidateUrl;
+          break;
+        }
+      } catch (error) {
+        fetchErrors.push(`${candidateUrl}: ${error.message}`);
       }
-    });
-    
-    // Parse HTML for VDS ID: 201 data
-    const html = response.data;
-    const vds201Section = extractVdsSection(html, 201);
+    }
 
-    if (!vds201Section) {
-      console.log('⚠️ Could not find VDS ID: 201 in response');
+    if (!html) {
+      const timestamp = new Date().toISOString();
+      const reason = fetchErrors.length > 0
+        ? `Failed to fetch ATIS source (${fetchErrors.join(' | ')})`
+        : 'Failed to fetch ATIS source (empty response)';
+      console.log(`⚠️ ${reason}`);
+      recordCounterFlowFailure(reason, timestamp, { fetchErrors });
       return null;
     }
 
+    // Parse HTML for VDS lane data (primary sensors 201 + 202).
+    const vds201Section = extractVdsSection(html, 201);
     const vds202Section = extractVdsSection(html, 202);
+    if (!vds201Section) {
+      console.log('⚠️ Could not find VDS ID: 201 section; attempting global lane parse fallback');
+    }
     const sensorSections = [
       { id: 201, section: vds201Section },
       { id: 202, section: vds202Section }
     ].filter((entry) => typeof entry.section === 'string' && entry.section.length > 0);
+    if (sensorSections.length === 0) {
+      sensorSections.push({ id: 'global', section: html });
+    }
 
     const previousLane1Closed = typeof counterFlowData?.rawData?.lane1Closed === 'boolean'
       ? counterFlowData.rawData.lane1Closed
@@ -1003,7 +1045,15 @@ const scrapeCounterFlowData = async () => {
       previousLane2Closed
     );
     if (lane1Closed === null || lane2Closed === null) {
-      console.log('⚠️ Could not reliably resolve current lane states for VDS 201/202; skipping update');
+      const timestamp = new Date().toISOString();
+      const reason = 'Could not reliably resolve current lane states for VDS 201/202';
+      console.log(`⚠️ ${reason}; skipping update`);
+      recordCounterFlowFailure(reason, timestamp, {
+        sourceUrlUsed,
+        sensorDebug,
+        vds201SectionPreview: typeof vds201Section === 'string' ? vds201Section.substring(0, 300) : null,
+        vds202SectionPreview: typeof vds202Section === 'string' ? vds202Section.substring(0, 300) : null
+      });
       return null;
     }
     
@@ -1036,17 +1086,19 @@ const scrapeCounterFlowData = async () => {
       status,
       lanesOutbound,
       timestamp,
+      sourceUrlUsed,
       rawData: {
         lane1Closed,
         lane2Closed,
         sensorDebug,
-        vds201Section: vds201Section.substring(0, 500), // First 500 chars for debugging
+        vds201Section: typeof vds201Section === 'string' ? vds201Section.substring(0, 500) : null, // First 500 chars for debugging
         vds202Section: typeof vds202Section === 'string' ? vds202Section.substring(0, 500) : null
       }
     };
     
   } catch (error) {
     console.log('❌ Counter-flow scraping failed:', error.message);
+    recordCounterFlowFailure(`Counter-flow scraping failed: ${error.message}`);
     return null;
   }
 };
@@ -1091,7 +1143,37 @@ const updateCounterFlowData = async () => {
   counterFlowData.lastChecked = newData.timestamp;
   counterFlowData.lanesOutbound = newData.lanesOutbound;
   counterFlowData.rawData = newData.rawData;
+  counterFlowData.lastError = null;
+  counterFlowData.sourceUrl = newData.sourceUrlUsed || counterFlowData.sourceUrl || null;
   invalidateTrafficTodayCache();
+};
+
+const bootstrapCounterFlowFromDatabase = async () => {
+  if (!db) return;
+  try {
+    const seedData = await db.getTodayTrafficData(2);
+    const seedCounterFlow = seedData?.counterFlow;
+    if (!seedCounterFlow || typeof seedCounterFlow !== 'object') return;
+
+    const seededStatus = typeof seedCounterFlow.currentStatus === 'string'
+      ? seedCounterFlow.currentStatus
+      : null;
+    const seededLanes = Number(seedCounterFlow.lanesOutbound);
+    const hasSeededLanes = Number.isFinite(seededLanes);
+    if (!seededStatus && !hasSeededLanes) return;
+
+    counterFlowData.currentStatus = seededStatus || counterFlowData.currentStatus;
+    counterFlowData.lanesOutbound = hasSeededLanes ? seededLanes : counterFlowData.lanesOutbound;
+    counterFlowData.statusSince = seedCounterFlow.statusSince || counterFlowData.statusSince;
+    counterFlowData.lastChecked = seedCounterFlow.lastChecked || counterFlowData.lastChecked;
+    counterFlowData.lastError = null;
+    console.log(
+      `🌉 Bootstrapped counter-flow from DB: status=${counterFlowData.currentStatus || 'unknown'}, ` +
+      `lanesOutbound=${Number.isFinite(Number(counterFlowData.lanesOutbound)) ? Number(counterFlowData.lanesOutbound) : 'unknown'}`
+    );
+  } catch (error) {
+    console.log(`⚠️ Counter-flow DB bootstrap failed: ${error.message}`);
+  }
 };
 
 // Collect traffic data
@@ -1514,11 +1596,13 @@ app.get('/api/counterflow/status', async (req, res) => {
         counterFlowData.lastChecked &&
         (now - new Date(counterFlowData.lastChecked).getTime()) < 5 * 60 * 1000
       ), // healthy if checked within 5 minutes
-      rawStatus: counterFlowData.currentStatus
+      rawStatus: counterFlowData.currentStatus,
+      lastError: counterFlowData.lastError || null
     };
 
     if (req.query.debug === '1') {
-      response.sourceUrl = BC_ATIS_URL;
+      response.sourceUrl = counterFlowData.sourceUrl || BC_ATIS_SOURCE_URLS[0];
+      response.sourceCandidates = BC_ATIS_SOURCE_URLS;
       response.parserDebug = counterFlowData.rawData || null;
     }
     
@@ -1559,6 +1643,9 @@ const startServer = async () => {
   // Collect every 2 minutes
   setInterval(collectTrafficData, 2 * 60 * 1000);
   
+  // Prime counter-flow state from latest persisted snapshot when available.
+  await bootstrapCounterFlowFromDatabase();
+
   // Collect counter-flow data every 60 seconds
   await updateCounterFlowData(); // Initial collection
   setInterval(updateCounterFlowData, 60 * 1000);
