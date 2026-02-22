@@ -779,11 +779,32 @@ const extractVdsSection = (html, vdsId) => {
 const extractLaneSection = (vdsSection, laneNumber) => {
   if (typeof vdsSection !== 'string' || !vdsSection) return null;
   const laneId = String(laneNumber).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const regex = new RegExp(
-    `Lane(?:\\s*Number)?\\s*[:#-]?\\s*${laneId}\\b[\\s\\S]*?(?=Lane(?:\\s*Number)?\\s*[:#-]?\\s*\\d+\\b|VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`,
+  const patterns = [
+    new RegExp(
+      `(?:Lane\\s*Number\\s*[:#-]?\\s*${laneId}\\b|Lane\\s+${laneId}\\b)[\\s\\S]*?(?=Lane\\s*(?:Number\\s*[:#-]?\\s*)?\\d+\\b|VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`,
+      'i'
+    ),
+    new RegExp(
+      `\\bLANE\\s*${laneId}\\b[\\s\\S]*?(?=\\bLANE\\s*\\d+\\b|VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`,
+      'i'
+    )
+  ];
+
+  for (const regex of patterns) {
+    const match = vdsSection.match(regex);
+    if (match && match[0]) return match[0];
+  }
+  return null;
+};
+
+const extractLaneSectionFromAnchorBlock = (vdsSection, laneNumber) => {
+  if (typeof vdsSection !== 'string' || !vdsSection) return null;
+  const laneId = String(laneNumber).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const anchorRegex = new RegExp(
+    `<a[^>]*name\\s*=\\s*["']?lane\\s*${laneId}["']?[^>]*>[\\s\\S]*?(?=<a[^>]*name\\s*=\\s*["']?lane\\s*\\d+["']?[^>]*>|VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`,
     'i'
   );
-  const match = vdsSection.match(regex);
+  const match = vdsSection.match(anchorRegex);
   return match ? match[0] : null;
 };
 
@@ -852,12 +873,61 @@ const extractLaneSectionFromPlainText = (vdsSection, laneNumber) => {
   const plainText = htmlToPlainText(vdsSection);
   if (!plainText) return null;
   const laneId = String(laneNumber).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const regex = new RegExp(
-    `Lane(?:\\s*Number)?\\s*[:#-]?\\s*${laneId}\\b[\\s\\S]*?(?=Lane(?:\\s*Number)?\\s*[:#-]?\\s*\\d+\\b|VDS\\s*ID\\s*[:#-]?\\s*\\d+\\b|ATC\\s*ID\\s*[:#-]?\\s*\\d+\\b|$)`,
+  const normalizedLines = plainText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (normalizedLines.length === 0) return null;
+
+  const laneHeaderRegex = new RegExp(
+    `^(?:Lane\\s*Number\\s*[:#-]?\\s*${laneId}\\b|Lane\\s*${laneId}\\b|Lane${laneId}\\b)`,
     'i'
   );
-  const match = plainText.match(regex);
-  return match ? match[0] : null;
+  const anyLaneHeaderRegex = /^(?:Lane\s*(?:Number\s*[:#-]?\s*)?\d+\b|Lane\d+\b)/i;
+  const sensorBoundaryRegex = /^(?:VDS|ATC)\s*ID\b/i;
+
+  const startIndex = normalizedLines.findIndex((line) => laneHeaderRegex.test(line));
+  if (startIndex >= 0) {
+    let endIndex = normalizedLines.length;
+    for (let i = startIndex + 1; i < normalizedLines.length; i += 1) {
+      const line = normalizedLines[i];
+      if (sensorBoundaryRegex.test(line)) {
+        endIndex = i;
+        break;
+      }
+      if (anyLaneHeaderRegex.test(line) && !laneHeaderRegex.test(line)) {
+        endIndex = i;
+        break;
+      }
+    }
+
+    const block = normalizedLines.slice(startIndex, endIndex).join('\n').trim();
+    if (block) return block;
+  }
+
+  const blockRegex = new RegExp(
+    `(?:^|\\n)\\s*(?:Lane\\s*Number\\s*[:#-]?\\s*${laneId}\\b|Lane\\s*${laneId}\\b|Lane${laneId}\\b)[\\s\\S]*?(?=\\n\\s*(?:Lane\\s*(?:Number\\s*[:#-]?\\s*)?\\d+\\b|Lane\\d+\\b|(?:VDS|ATC)\\s*ID\\b)|$)`,
+    'i'
+  );
+  const blockMatch = plainText.match(blockRegex);
+  return blockMatch ? blockMatch[0].trim() : null;
+};
+
+const extractLaneSectionRobust = (vdsSection, laneNumber) => {
+  const strategies = [
+    { source: 'plain-text', fn: extractLaneSectionFromPlainText },
+    { source: 'html-anchor', fn: extractLaneSectionFromAnchorBlock },
+    { source: 'generic', fn: extractLaneSection }
+  ];
+
+  for (const strategy of strategies) {
+    const section = strategy.fn(vdsSection, laneNumber);
+    if (typeof section === 'string' && section.trim().length > 0) {
+      return { section, source: strategy.source };
+    }
+  }
+
+  return { section: null, source: null };
 };
 
 const parseLaneTelemetryMetrics = (laneSection) => {
@@ -1015,12 +1085,10 @@ const scrapeCounterFlowData = async () => {
       : null;
 
     const sensorDebug = sensorSections.map((entry) => {
-      const lane1Section =
-        extractLaneSection(entry.section, 1) ||
-        extractLaneSectionFromPlainText(entry.section, 1);
-      const lane2Section =
-        extractLaneSection(entry.section, 2) ||
-        extractLaneSectionFromPlainText(entry.section, 2);
+      const lane1Extracted = extractLaneSectionRobust(entry.section, 1);
+      const lane2Extracted = extractLaneSectionRobust(entry.section, 2);
+      const lane1Section = lane1Extracted.section;
+      const lane2Section = lane2Extracted.section;
       const lane1CurrentStatuses = parseCurrentLaneStatuses(lane1Section);
       const lane2CurrentStatuses = parseCurrentLaneStatuses(lane2Section);
       const lane1Closed = resolveLaneClosedFromSection(lane1Section);
@@ -1029,6 +1097,8 @@ const scrapeCounterFlowData = async () => {
         vdsId: entry.id,
         lane1Closed,
         lane2Closed,
+        lane1Source: lane1Extracted.source,
+        lane2Source: lane2Extracted.source,
         lane1CurrentStatuses,
         lane2CurrentStatuses,
         lane1SectionPreview: String(lane1Section || '').substring(0, 220),
