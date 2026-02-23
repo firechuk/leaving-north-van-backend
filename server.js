@@ -54,6 +54,35 @@ const MANUAL_TRACKED_SOURCE_IDS = new Set([
   'here-net-fdc3c855f1a803'
 ]);
 const TRAFFIC_DB_STALE_MAX_AGE_MS = 12 * 60 * 1000;
+const TRAFFIC_COLLECTION_TIME_ZONE = 'America/Vancouver';
+const TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES || '2', 10);
+  if (!Number.isFinite(parsed)) return 2;
+  return Math.max(1, Math.min(60, parsed));
+})();
+const TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES || '10', 10);
+  if (!Number.isFinite(parsed)) return 10;
+  return Math.max(TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES, Math.min(180, parsed));
+})();
+const TRAFFIC_COLLECTION_OFFPEAK_START_HOUR = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_OFFPEAK_START_HOUR || '2', 10);
+  if (!Number.isFinite(parsed)) return 2;
+  return Math.max(0, Math.min(23, parsed));
+})();
+const TRAFFIC_COLLECTION_OFFPEAK_END_HOUR = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_OFFPEAK_END_HOUR || '5', 10);
+  if (!Number.isFinite(parsed)) return 5;
+  return Math.max(0, Math.min(23, parsed));
+})();
+const TRAFFIC_COLLECTION_PEAK_INTERVAL_MS = TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES * 60 * 1000;
+const TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MS = TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES * 60 * 1000;
+const trafficCollectionHourFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: TRAFFIC_COLLECTION_TIME_ZONE,
+  hour: '2-digit',
+  hour12: false,
+  hourCycle: 'h23'
+});
 const MIN_FILTERED_SEGMENTS_FOR_TRACKED = 12;
 const BRIDGE_CORRIDORS = {
   lionsGate: {
@@ -113,6 +142,9 @@ const NORTH_VAN_ROADS = [
 let trafficIntervals = [];
 let segmentData = {};
 let isCollecting = false;
+let trafficCollectionTimer = null;
+let trafficCollectionInFlight = false;
+let lastTrafficCollectionCadenceLabel = null;
 
 // Database integration
 let db;
@@ -181,6 +213,85 @@ const setTrafficTodayCachePayload = (cacheKey, payload) => {
 
 const invalidateTrafficTodayCache = () => {
   trafficTodayCache.clear();
+};
+
+const getTrafficCollectionLocalHour = (date = new Date()) => {
+  const hourText = trafficCollectionHourFormatter.format(date);
+  const parsedHour = Number.parseInt(hourText, 10);
+  if (Number.isFinite(parsedHour)) return parsedHour;
+  return date.getUTCHours();
+};
+
+const isHourInCollectionWindow = (hour, startHour, endHour) => {
+  if (startHour === endHour) return false;
+  if (startHour < endHour) {
+    return hour >= startHour && hour < endHour;
+  }
+  return hour >= startHour || hour < endHour;
+};
+
+const getTrafficCollectionCadence = (date = new Date()) => {
+  const localHour = getTrafficCollectionLocalHour(date);
+  const inOffPeakWindow = isHourInCollectionWindow(
+    localHour,
+    TRAFFIC_COLLECTION_OFFPEAK_START_HOUR,
+    TRAFFIC_COLLECTION_OFFPEAK_END_HOUR
+  );
+  const intervalMs = inOffPeakWindow
+    ? TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MS
+    : TRAFFIC_COLLECTION_PEAK_INTERVAL_MS;
+  const intervalMinutes = Math.round(intervalMs / (60 * 1000));
+  const label = `${inOffPeakWindow ? 'off-peak' : 'peak'}:${intervalMinutes}m`;
+  return {
+    intervalMs,
+    intervalMinutes,
+    inOffPeakWindow,
+    localHour,
+    label
+  };
+};
+
+const scheduleNextTrafficCollection = (delayMs = null) => {
+  if (!isCollecting) return;
+  if (trafficCollectionTimer) {
+    clearTimeout(trafficCollectionTimer);
+  }
+  const cadence = getTrafficCollectionCadence(new Date());
+  const effectiveDelayMs = Number.isFinite(delayMs) && delayMs >= 0
+    ? delayMs
+    : cadence.intervalMs;
+  trafficCollectionTimer = setTimeout(runTrafficCollectionCycle, effectiveDelayMs);
+};
+
+const runTrafficCollectionCycle = async () => {
+  if (!isCollecting) return;
+  if (trafficCollectionInFlight) {
+    console.warn('⚠️ Traffic collection overlap detected; delaying next cycle by 15s');
+    scheduleNextTrafficCollection(15 * 1000);
+    return;
+  }
+
+  const cycleStartedAt = Date.now();
+  const startCadence = getTrafficCollectionCadence(new Date(cycleStartedAt));
+  if (startCadence.label !== lastTrafficCollectionCadenceLabel) {
+    console.log(
+      `⏱️ Traffic collection cadence: ${startCadence.label} ` +
+      `(hour ${startCadence.localHour}, tz=${TRAFFIC_COLLECTION_TIME_ZONE}, ` +
+      `off-peak window ${TRAFFIC_COLLECTION_OFFPEAK_START_HOUR}:00-${TRAFFIC_COLLECTION_OFFPEAK_END_HOUR}:00)`
+    );
+    lastTrafficCollectionCadenceLabel = startCadence.label;
+  }
+
+  trafficCollectionInFlight = true;
+  try {
+    await collectTrafficData();
+  } finally {
+    trafficCollectionInFlight = false;
+    const nextCadence = getTrafficCollectionCadence(new Date());
+    const elapsedMs = Date.now() - cycleStartedAt;
+    const nextDelayMs = Math.max(1000, nextCadence.intervalMs - elapsedMs);
+    scheduleNextTrafficCollection(nextDelayMs);
+  }
 };
 
 const toFiniteNumber = (value) => {
@@ -1300,7 +1411,7 @@ const collectTrafficData = async () => {
     
     trafficIntervals.push(interval);
     
-    // Keep last 24 hours (720 2-minute intervals)
+    // Keep a bounded in-memory timeline for live fallback responses.
     if (trafficIntervals.length > 720) {
       trafficIntervals = trafficIntervals.slice(-720);
     }
@@ -1766,13 +1877,16 @@ app.get('/api/counterflow/history', async (req, res) => {
 // Initialize and start
 const startServer = async () => {
   console.log('🚀 Starting North Vancouver Traffic Server (HERE API)...');
+  console.log(
+    `⏱️ Traffic cadence config: peak=${TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES}m, ` +
+    `off-peak=${TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES}m, ` +
+    `window=${TRAFFIC_COLLECTION_OFFPEAK_START_HOUR}:00-${TRAFFIC_COLLECTION_OFFPEAK_END_HOUR}:00 ` +
+    `${TRAFFIC_COLLECTION_TIME_ZONE}`
+  );
   
   // Start data collection
   isCollecting = true;
-  await collectTrafficData();
-  
-  // Collect every 2 minutes
-  setInterval(collectTrafficData, 2 * 60 * 1000);
+  await runTrafficCollectionCycle();
 
   // Lightweight memory heartbeat for crash triage on Railway.
   setInterval(() => {
