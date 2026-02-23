@@ -188,6 +188,11 @@ function quoteIdentifier(identifier) {
     return `"${String(identifier).replace(/"/g, '""')}"`;
 }
 
+function extractSegmentIdsFromInterval(intervalData) {
+    if (!intervalData || typeof intervalData !== 'object') return [];
+    return Object.keys(intervalData).filter((key) => key && key !== 'timestamp');
+}
+
 class TrafficDatabase {
     constructor() {
         this.pool = new Pool({
@@ -201,10 +206,27 @@ class TrafficDatabase {
     async initDatabase() {
         try {
             console.log('✅ Database connection established');
+            await this.ensureSegmentMetadataTable();
             await this.ensureTrafficSnapshotsConstraints();
         } catch (error) {
             console.error('❌ Database initialization failed:', error);
         }
+    }
+
+    async ensureSegmentMetadataTable() {
+        await this.pool.query(`
+            CREATE TABLE IF NOT EXISTS traffic_segment_catalog (
+                segment_id TEXT PRIMARY KEY,
+                metadata JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        `);
+        await this.pool.query(`
+            CREATE INDEX IF NOT EXISTS traffic_segment_catalog_updated_at_idx
+            ON traffic_segment_catalog (updated_at DESC);
+        `);
+        console.log('✅ Segment metadata catalog ready');
     }
 
     async ensureTrafficSnapshotsConstraints() {
@@ -292,29 +314,100 @@ class TrafficDatabase {
             client.release();
         }
     }
+
+    async upsertSegmentCatalog(segmentData, client) {
+        const segmentEntries = Object.entries(segmentData || {}).filter(([segmentId, metadata]) => {
+            return !!segmentId && metadata && typeof metadata === 'object';
+        });
+        if (segmentEntries.length === 0) return 0;
+
+        const values = [];
+        const valueTuples = [];
+        segmentEntries.forEach(([segmentId, metadata], index) => {
+            const base = index * 2;
+            const normalizedMetadata = {
+                ...metadata,
+                id: metadata.id || segmentId,
+                segmentId: metadata.segmentId || segmentId
+            };
+            values.push(segmentId);
+            values.push(JSON.stringify(normalizedMetadata));
+            valueTuples.push(`($${base + 1}, $${base + 2}::jsonb)`);
+        });
+
+        const query = `
+            INSERT INTO traffic_segment_catalog (segment_id, metadata)
+            VALUES ${valueTuples.join(', ')}
+            ON CONFLICT (segment_id) DO UPDATE
+            SET metadata = EXCLUDED.metadata,
+                updated_at = NOW()
+            WHERE traffic_segment_catalog.metadata IS DISTINCT FROM EXCLUDED.metadata;
+        `;
+
+        const result = await client.query(query, values);
+        return result.rowCount || 0;
+    }
+
+    async getSegmentMetadataByIds(segmentIds) {
+        const normalizedIds = [...new Set(
+            (Array.isArray(segmentIds) ? segmentIds : [])
+                .map((value) => String(value || '').trim())
+                .filter(Boolean)
+        )];
+        if (normalizedIds.length === 0) return {};
+
+        const query = `
+            SELECT segment_id, metadata
+            FROM traffic_segment_catalog
+            WHERE segment_id = ANY($1::text[]);
+        `;
+        const result = await this.pool.query(query, [normalizedIds]);
+        const segmentMap = {};
+
+        result.rows.forEach((row) => {
+            if (!row || !row.segment_id) return;
+            const metadata = row.metadata && typeof row.metadata === 'object'
+                ? { ...row.metadata }
+                : null;
+            if (!metadata) return;
+            metadata.id = metadata.id || row.segment_id;
+            metadata.segmentId = metadata.segmentId || row.segment_id;
+            segmentMap[row.segment_id] = metadata;
+        });
+
+        return segmentMap;
+    }
     
     // Save complete traffic snapshot (replaces in-memory storage)
     async saveTrafficSnapshot(intervalData, segmentData, counterFlowData) {
+        let client;
         try {
             if (this.readyPromise) {
                 await this.readyPromise;
             }
+            client = await this.pool.connect();
+            await client.query('BEGIN');
             const now = new Date();
             const dateKey = getServiceDayKey(now);
             const intervalIndex = this.calculateIntervalIndex(now);
+            const catalogWrites = await this.upsertSegmentCatalog(segmentData, client);
             
+            // Compact payload: segment metadata is normalized into traffic_segment_catalog.
+            // Keep interval + counter-flow in snapshots for timeline playback accuracy.
             const snapshotData = {
                 intervalData,
-                segmentData,
                 counterFlowData,
-                timestamp: now.toISOString()
+                timestamp: now.toISOString(),
+                segmentDataRef: 'traffic_segment_catalog'
             };
+            const rawSnapshotData = JSON.stringify(snapshotData);
+            const payloadBytes = Buffer.byteLength(rawSnapshotData, 'utf8');
 
             const values = [
                 now.toISOString(), // Convert Date to ISO string for TEXT column
                 dateKey,
                 intervalIndex, 
-                JSON.stringify(snapshotData)
+                rawSnapshotData
             ];
 
             // Robust upsert that does not rely on ON CONFLICT index inference.
@@ -327,40 +420,59 @@ class TrafficDatabase {
                   AND interval_index = $3
                 RETURNING id;
             `;
-            const updateResult = await this.pool.query(updateQuery, values);
+            let savedSnapshotId = null;
+            let saveMode = null;
+            const updateResult = await client.query(updateQuery, values);
             if (updateResult.rows.length > 0) {
-                const updatedId = updateResult.rows[0].id;
-                console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${updatedId}, mode:update)`);
-                return updatedId;
+                savedSnapshotId = updateResult.rows[0].id;
+                saveMode = 'update';
             }
-
+            
             const insertQuery = `
                 INSERT INTO traffic_snapshots (observed_at, date_key, interval_index, raw_data)
                 VALUES ($1, $2, $3, $4)
                 RETURNING id;
             `;
 
-            try {
-                const insertResult = await this.pool.query(insertQuery, values);
-                const insertedId = insertResult.rows[0].id;
-                console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${insertedId}, mode:insert)`);
-                return insertedId;
-            } catch (insertError) {
-                // Race-safe fallback when a concurrent writer inserts between update/insert.
-                if (insertError?.code === '23505') {
-                    const retryUpdateResult = await this.pool.query(updateQuery, values);
-                    if (retryUpdateResult.rows.length > 0) {
-                        const retryId = retryUpdateResult.rows[0].id;
-                        console.log(`✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} (id: ${retryId}, mode:retry-update)`);
-                        return retryId;
+            if (!savedSnapshotId) {
+                try {
+                    const insertResult = await client.query(insertQuery, values);
+                    savedSnapshotId = insertResult.rows[0].id;
+                    saveMode = 'insert';
+                } catch (insertError) {
+                    // Race-safe fallback when a concurrent writer inserts between update/insert.
+                    if (insertError?.code === '23505') {
+                        const retryUpdateResult = await client.query(updateQuery, values);
+                        if (retryUpdateResult.rows.length > 0) {
+                            savedSnapshotId = retryUpdateResult.rows[0].id;
+                            saveMode = 'retry-update';
+                        }
+                    }
+                    if (!savedSnapshotId) {
+                        throw insertError;
                     }
                 }
-                throw insertError;
             }
+            
+            await client.query('COMMIT');
+            console.log(
+                `✅ Saved/upserted traffic snapshot ${dateKey}-${intervalIndex} ` +
+                `(id: ${savedSnapshotId}, mode:${saveMode}, catalogWrites:${catalogWrites}, payloadBytes:${payloadBytes})`
+            );
+            return savedSnapshotId;
         } catch (error) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (rollbackError) {
+                console.error('❌ Failed to rollback traffic snapshot transaction:', rollbackError.message);
+            }
             console.error('❌ Failed to save traffic snapshot:', error.message);
             console.error('❌ Full error details:', error);
             throw error;
+        } finally {
+            if (client) {
+                client.release();
+            }
         }
     }
     
@@ -416,6 +528,7 @@ class TrafficDatabase {
             // Reconstruct data from database
             const intervals = [];
             const segments = {};
+            const observedSegmentIds = new Set();
             let counterFlow = {};
             let rewrittenTimestampCount = 0;
             
@@ -435,6 +548,9 @@ class TrafficDatabase {
                             rewrittenTimestampCount += 1;
                         }
                         intervals.push(intervalData);
+                        extractSegmentIdsFromInterval(intervalData).forEach((segmentId) => {
+                            observedSegmentIds.add(segmentId);
+                        });
                     }
 
                     if (snapshot.segmentData && typeof snapshot.segmentData === 'object') {
@@ -449,11 +565,30 @@ class TrafficDatabase {
                     // Skip corrupted records but continue processing others
                 }
             });
+
+            const missingSegmentIds = [...observedSegmentIds].filter((segmentId) => !segments[segmentId]);
+            let catalogSegmentsLoaded = 0;
+            if (missingSegmentIds.length > 0) {
+                try {
+                    const catalogSegments = await this.getSegmentMetadataByIds(missingSegmentIds);
+                    catalogSegmentsLoaded = Object.keys(catalogSegments).length;
+                    Object.assign(segments, catalogSegments);
+                    if (catalogSegmentsLoaded > 0) {
+                        console.log(
+                            `🧩 DB read: loaded ${catalogSegmentsLoaded}/${missingSegmentIds.length} ` +
+                            `missing segment metadata rows from traffic_segment_catalog`
+                        );
+                    }
+                } catch (catalogError) {
+                    console.warn(`⚠️ Segment catalog lookup failed: ${catalogError.message}`);
+                }
+            }
             
             console.log(
                 `✅ DB read success: Reconstructed ${intervals.length} intervals, ` +
                 `${Object.keys(segments).length} segments from ${result.rows.length} total rows ` +
-                `(${rewrittenTimestampCount} interval timestamps normalized from observed_at)`
+                `(${rewrittenTimestampCount} interval timestamps normalized from observed_at, ` +
+                `${catalogSegmentsLoaded} loaded from segment catalog)`
             );
             
             // Return data even if some records were corrupted (better than complete failure)
