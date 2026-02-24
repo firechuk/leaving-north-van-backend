@@ -27,10 +27,10 @@ const TRAFFIC_TODAY_CACHE_TTL_MS = 60 * 1000;
 const TRAFFIC_TODAY_CACHE_MAX_KEYS = 8;
 const TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS = 2;
 const TRAFFIC_TODAY_MAX_SERVICE_DAYS = 21;
-const TRAFFIC_TODAY_ABSOLUTE_SAFE_MAX_SERVICE_DAYS = 3;
+const TRAFFIC_TODAY_ABSOLUTE_SAFE_MAX_SERVICE_DAYS = 7;
 const TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS = (() => {
-  const parsed = Number.parseInt(process.env.TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS || '2', 10);
-  if (!Number.isFinite(parsed)) return 2;
+  const parsed = Number.parseInt(process.env.TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS || '5', 10);
+  if (!Number.isFinite(parsed)) return 5;
   return Math.max(
     1,
     Math.min(
