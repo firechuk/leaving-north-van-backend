@@ -77,6 +77,36 @@ function formatDayKeyFromParts(year, month, day) {
     return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
+function parseDayKey(dayKey) {
+    if (typeof dayKey !== 'string') return null;
+    const match = dayKey.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const candidate = new Date(Date.UTC(year, month - 1, day));
+    if (
+        candidate.getUTCFullYear() !== year ||
+        candidate.getUTCMonth() + 1 !== month ||
+        candidate.getUTCDate() !== day
+    ) {
+        return null;
+    }
+    return { year, month, day };
+}
+
+function shiftDayKey(dayKey, deltaDays) {
+    const parsed = parseDayKey(dayKey);
+    if (!parsed) return dayKey;
+    const date = new Date(Date.UTC(parsed.year, parsed.month - 1, parsed.day));
+    date.setUTCDate(date.getUTCDate() + deltaDays);
+    return formatDayKeyFromParts(
+        date.getUTCFullYear(),
+        date.getUTCMonth() + 1,
+        date.getUTCDate()
+    );
+}
+
 function getUtcForTimeZoneDateTime(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0, timeZone = SERVICE_TIME_ZONE) {
     let utcMs = Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
     for (let i = 0; i < 3; i++) {
@@ -604,6 +634,158 @@ class TrafficDatabase {
             };
         } catch (error) {
             console.error('❌ Failed to get traffic data from database:', error);
+            return null;
+        }
+    }
+
+    // Get traffic data for a centered service-day window (e.g. selected day +/- 1 day).
+    async getTrafficDataForDayWindow(centerDayKey, radiusDays = 1) {
+        try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
+            const parsedCenterDay = parseDayKey(centerDayKey);
+            if (!parsedCenterDay) {
+                throw new Error(`Invalid centerDayKey: ${centerDayKey}`);
+            }
+
+            const normalizedRadiusDays = Math.max(0, Math.min(3, Number(radiusDays) || 0));
+            const startDayKey = shiftDayKey(centerDayKey, -normalizedRadiusDays);
+            const endDayKeyExclusive = shiftDayKey(centerDayKey, normalizedRadiusDays + 1);
+            const parsedStartDay = parseDayKey(startDayKey);
+            const parsedEndDay = parseDayKey(endDayKeyExclusive);
+
+            const windowStartUtc = getUtcForTimeZoneDateTime(
+                parsedStartDay.year,
+                parsedStartDay.month,
+                parsedStartDay.day,
+                SERVICE_DAY_START_HOUR,
+                0,
+                0,
+                0,
+                SERVICE_TIME_ZONE
+            );
+            const windowEndUtc = getUtcForTimeZoneDateTime(
+                parsedEndDay.year,
+                parsedEndDay.month,
+                parsedEndDay.day,
+                SERVICE_DAY_START_HOUR,
+                0,
+                0,
+                0,
+                SERVICE_TIME_ZONE
+            );
+
+            const windowStartIso = windowStartUtc.toISOString();
+            const endIso = windowEndUtc.toISOString();
+            console.log(
+                `🔍 DB READ: Querying day window center=${centerDayKey} radius=${normalizedRadiusDays} ` +
+                `(${windowStartIso} → ${endIso}, ${SERVICE_TIME_ZONE}, startHour=${SERVICE_DAY_START_HOUR})`
+            );
+
+            const query = `
+                SELECT interval_index, raw_data, observed_at
+                FROM traffic_snapshots
+                WHERE observed_at >= $1 AND observed_at < $2
+                ORDER BY observed_at ASC;
+            `;
+
+            const result = await this.pool.query(query, [windowStartIso, endIso]);
+            console.log(
+                `🔍 DB window read result: Found ${result.rows.length} rows for ` +
+                `${startDayKey}..${shiftDayKey(endDayKeyExclusive, -1)}`
+            );
+
+            if (result.rows.length === 0) {
+                return {
+                    intervals: [],
+                    segments: {},
+                    counterFlow: {},
+                    centerDayKey,
+                    radiusDays: normalizedRadiusDays,
+                    startDayKey,
+                    endDayKeyExclusive,
+                    fromDatabase: true,
+                    recordCount: 0,
+                    validRecords: 0,
+                    corruptedRecords: 0
+                };
+            }
+
+            const intervals = [];
+            const segments = {};
+            const observedSegmentIds = new Set();
+            let counterFlow = {};
+            let rewrittenTimestampCount = 0;
+
+            result.rows.forEach((row, index) => {
+                try {
+                    const snapshot = JSON.parse(row.raw_data);
+                    const intervalData = snapshot.intervalData && typeof snapshot.intervalData === 'object'
+                        ? { ...snapshot.intervalData }
+                        : null;
+
+                    if (intervalData) {
+                        const observedAtIso = normalizeObservedAtTimestamp(row.observed_at);
+                        if (observedAtIso && intervalData.timestamp !== observedAtIso) {
+                            intervalData.timestamp = observedAtIso;
+                            rewrittenTimestampCount += 1;
+                        }
+                        intervals.push(intervalData);
+                        extractSegmentIdsFromInterval(intervalData).forEach((segmentId) => {
+                            observedSegmentIds.add(segmentId);
+                        });
+                    }
+
+                    if (snapshot.segmentData && typeof snapshot.segmentData === 'object') {
+                        Object.assign(segments, snapshot.segmentData);
+                    }
+                    counterFlow = snapshot.counterFlowData;
+                } catch (parseError) {
+                    console.error(`❌ JSON parse error for day-window row ${index}:`, parseError.message);
+                }
+            });
+
+            const missingSegmentIds = [...observedSegmentIds].filter((segmentId) => !segments[segmentId]);
+            let catalogSegmentsLoaded = 0;
+            if (missingSegmentIds.length > 0) {
+                try {
+                    const catalogSegments = await this.getSegmentMetadataByIds(missingSegmentIds);
+                    catalogSegmentsLoaded = Object.keys(catalogSegments).length;
+                    Object.assign(segments, catalogSegments);
+                    if (catalogSegmentsLoaded > 0) {
+                        console.log(
+                            `🧩 DB day-window read: loaded ${catalogSegmentsLoaded}/${missingSegmentIds.length} ` +
+                            `missing segment metadata rows from traffic_segment_catalog`
+                        );
+                    }
+                } catch (catalogError) {
+                    console.warn(`⚠️ Segment catalog lookup failed (day-window): ${catalogError.message}`);
+                }
+            }
+
+            console.log(
+                `✅ DB day-window read success: Reconstructed ${intervals.length} intervals, ` +
+                `${Object.keys(segments).length} segments from ${result.rows.length} total rows ` +
+                `(${rewrittenTimestampCount} interval timestamps normalized from observed_at, ` +
+                `${catalogSegmentsLoaded} loaded from segment catalog)`
+            );
+
+            return {
+                intervals,
+                segments,
+                counterFlow,
+                centerDayKey,
+                radiusDays: normalizedRadiusDays,
+                startDayKey,
+                endDayKeyExclusive,
+                fromDatabase: true,
+                recordCount: result.rows.length,
+                validRecords: intervals.length,
+                corruptedRecords: result.rows.length - intervals.length
+            };
+        } catch (error) {
+            console.error('❌ Failed to get day-window traffic data from database:', error);
             return null;
         }
     }

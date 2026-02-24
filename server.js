@@ -25,6 +25,9 @@ const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 const TRAFFIC_TODAY_CACHE_TTL_MS = 60 * 1000;
 const TRAFFIC_TODAY_CACHE_MAX_KEYS = 8;
+const TRAFFIC_DAY_WINDOW_CACHE_TTL_MS = 60 * 1000;
+const TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS = 24;
+const TRAFFIC_DAY_WINDOW_MAX_RADIUS = 2;
 const TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS = 2;
 const TRAFFIC_TODAY_MAX_SERVICE_DAYS = 21;
 const TRAFFIC_TODAY_ABSOLUTE_SAFE_MAX_SERVICE_DAYS = 7;
@@ -181,8 +184,11 @@ let debugRouteSnapshot = {
 
 let trafficTodayCache = new Map();
 const trafficTodayInFlight = new Map();
+let trafficDayWindowCache = new Map();
+const trafficDayWindowInFlight = new Map();
 
 const getTrafficTodayCacheKey = (serviceDays) => `serviceDays:${serviceDays}`;
+const getTrafficDayWindowCacheKey = (centerDay, radiusDays) => `day:${centerDay}|radius:${radiusDays}`;
 
 const getTrafficTodayCachePayload = (cacheKey) => {
   const cacheEntry = trafficTodayCache.get(cacheKey);
@@ -213,6 +219,33 @@ const setTrafficTodayCachePayload = (cacheKey, payload) => {
 
 const invalidateTrafficTodayCache = () => {
   trafficTodayCache.clear();
+  trafficDayWindowCache.clear();
+};
+
+const getTrafficDayWindowCachePayload = (cacheKey) => {
+  const cacheEntry = trafficDayWindowCache.get(cacheKey);
+  if (!cacheEntry) return null;
+  if (Date.now() >= cacheEntry.expiresAt) {
+    trafficDayWindowCache.delete(cacheKey);
+    return null;
+  }
+  return cacheEntry.payload;
+};
+
+const setTrafficDayWindowCachePayload = (cacheKey, payload) => {
+  if (trafficDayWindowCache.has(cacheKey)) {
+    trafficDayWindowCache.delete(cacheKey);
+  }
+  trafficDayWindowCache.set(cacheKey, {
+    expiresAt: Date.now() + TRAFFIC_DAY_WINDOW_CACHE_TTL_MS,
+    payload
+  });
+
+  while (trafficDayWindowCache.size > TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS) {
+    const oldestKey = trafficDayWindowCache.keys().next().value;
+    if (!oldestKey) break;
+    trafficDayWindowCache.delete(oldestKey);
+  }
 };
 
 const getTrafficCollectionLocalHour = (date = new Date()) => {
@@ -1462,6 +1495,130 @@ app.get('/health', (req, res) => {
     intervals: trafficIntervals.length,
     collecting: isCollecting
   });
+});
+
+app.get('/api/traffic/window', async (req, res) => {
+  try {
+    if (!db) {
+      res.status(503).json({
+        error: 'Database is required for day-window traffic queries'
+      });
+      return;
+    }
+
+    const centerDayRaw = String(req.query.centerDay || req.query.day || '').trim();
+    const centerDayMatch = centerDayRaw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!centerDayMatch) {
+      res.status(400).json({
+        error: 'Missing or invalid centerDay. Expected YYYY-MM-DD.'
+      });
+      return;
+    }
+
+    const requestedRadiusRaw = Number.parseInt(req.query.radius, 10);
+    const requestedRadius = Number.isFinite(requestedRadiusRaw) ? requestedRadiusRaw : 1;
+    const radiusDays = Math.max(0, Math.min(TRAFFIC_DAY_WINDOW_MAX_RADIUS, requestedRadius));
+    if (radiusDays !== requestedRadius) {
+      console.warn(
+        `⚠️ /api/traffic/window requested radius=${requestedRadius} capped to ${radiusDays} ` +
+        `(max ${TRAFFIC_DAY_WINDOW_MAX_RADIUS})`
+      );
+    }
+
+    const refreshParam = String(req.query.refresh || '').toLowerCase();
+    const bypassCache = refreshParam === '1' || refreshParam === 'true' || refreshParam === 'yes';
+    const cacheKey = getTrafficDayWindowCacheKey(centerDayRaw, radiusDays);
+
+    if (!bypassCache) {
+      const cachedPayload = getTrafficDayWindowCachePayload(cacheKey);
+      if (cachedPayload) {
+        console.log(`📦 /api/traffic/window cache hit (${cacheKey})`);
+        res.set('X-Traffic-Cache', 'HIT');
+        res.json(cachedPayload);
+        return;
+      }
+    }
+
+    console.log(`📦 /api/traffic/window cache miss (${cacheKey}${bypassCache ? ', bypassed' : ''})`);
+    res.set('X-Traffic-Cache', 'MISS');
+
+    let inFlightGate = null;
+    if (!bypassCache) {
+      const existingInFlight = trafficDayWindowInFlight.get(cacheKey);
+      if (existingInFlight && existingInFlight.promise) {
+        console.log(`⏳ /api/traffic/window waiting for in-flight fetch (${cacheKey})`);
+        try {
+          await existingInFlight.promise;
+        } catch (_error) {
+          // Ignore gate wait errors and proceed below.
+        }
+        const waitedCachePayload = getTrafficDayWindowCachePayload(cacheKey);
+        if (waitedCachePayload) {
+          console.log(`📦 /api/traffic/window in-flight cache hit (${cacheKey})`);
+          res.set('X-Traffic-Cache', 'WAIT-HIT');
+          res.json(waitedCachePayload);
+          return;
+        }
+      }
+
+      let resolveGate;
+      const gatePromise = new Promise((resolve) => {
+        resolveGate = resolve;
+      });
+      inFlightGate = { promise: gatePromise, resolve: resolveGate };
+      trafficDayWindowInFlight.set(cacheKey, inFlightGate);
+    }
+
+    try {
+      console.log(`📊 API Request: /api/traffic/window centerDay=${centerDayRaw} radius=${radiusDays}`);
+      const dbData = await db.getTrafficDataForDayWindow(centerDayRaw, radiusDays);
+      if (!dbData) {
+        res.status(500).json({
+          error: 'Failed to fetch day-window traffic data'
+        });
+        return;
+      }
+
+      const segmentCount = Object.keys(dbData.segments || {}).length;
+      const response = {
+        intervals: dbData.intervals || [],
+        segments: dbData.segments || {},
+        totalSegments: segmentCount,
+        currentIntervalIndex: (dbData.intervals || []).length - 1,
+        maxInterval: (dbData.intervals || []).length - 1,
+        coverage: `North Vancouver day window: ${segmentCount} segments across ${NORTH_VAN_ROADS.length} major roads`,
+        dataSource: 'database-window',
+        counterFlow: {
+          status: counterFlowData.currentStatus ?? dbData.counterFlow?.currentStatus,
+          lanesOutbound: counterFlowData.lanesOutbound || dbData.counterFlow?.lanesOutbound || 1,
+          statusSince: counterFlowData.statusSince || dbData.counterFlow?.statusSince,
+          lastChecked: counterFlowData.lastChecked || dbData.counterFlow?.lastChecked,
+          durationMs: (counterFlowData.statusSince || dbData.counterFlow?.statusSince)
+            ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
+            : null
+        },
+        fromDatabase: true,
+        centerDayKey: dbData.centerDayKey || centerDayRaw,
+        radiusDays: dbData.radiusDays ?? radiusDays,
+        startDayKey: dbData.startDayKey,
+        endDayKeyExclusive: dbData.endDayKeyExclusive,
+        dbRecordCount: dbData.recordCount ?? (dbData.intervals || []).length
+      };
+      setTrafficDayWindowCachePayload(cacheKey, response);
+      res.json(response);
+    } finally {
+      if (inFlightGate && trafficDayWindowInFlight.get(cacheKey) === inFlightGate) {
+        inFlightGate.resolve();
+        trafficDayWindowInFlight.delete(cacheKey);
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error in /api/traffic/window:', error);
+    res.status(500).json({
+      error: 'Failed to fetch traffic day-window',
+      details: error.message
+    });
+  }
 });
 
 app.get('/api/traffic/today', async (req, res) => {
