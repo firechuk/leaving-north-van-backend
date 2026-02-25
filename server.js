@@ -24,10 +24,38 @@ const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 const TRAFFIC_TODAY_CACHE_TTL_MS = 60 * 1000;
-const TRAFFIC_TODAY_CACHE_MAX_KEYS = 8;
+const TRAFFIC_TODAY_CACHE_MAX_KEYS = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_TODAY_CACHE_MAX_KEYS || '3', 10);
+  if (!Number.isFinite(parsed)) return 3;
+  return Math.max(1, Math.min(12, parsed));
+})();
 const TRAFFIC_DAY_WINDOW_CACHE_TTL_MS = 60 * 1000;
-const TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS = 24;
+const TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS || '6', 10);
+  if (!Number.isFinite(parsed)) return 6;
+  return Math.max(1, Math.min(24, parsed));
+})();
 const TRAFFIC_DAY_WINDOW_MAX_RADIUS = 2;
+const TRAFFIC_HEAVY_READ_MAX_CONCURRENCY = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_HEAVY_READ_MAX_CONCURRENCY || '2', 10);
+  if (!Number.isFinite(parsed)) return 2;
+  return Math.max(1, Math.min(8, parsed));
+})();
+const TRAFFIC_HEAVY_READ_WAIT_TIMEOUT_MS = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_HEAVY_READ_WAIT_TIMEOUT_MS || '8000', 10);
+  if (!Number.isFinite(parsed)) return 8000;
+  return Math.max(1000, Math.min(30000, parsed));
+})();
+const TRAFFIC_HEAP_SOFT_LIMIT_MB = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_HEAP_SOFT_LIMIT_MB || '320', 10);
+  if (!Number.isFinite(parsed)) return 320;
+  return Math.max(128, Math.min(1024, parsed));
+})();
+const TRAFFIC_HEAP_HARD_REJECT_MB = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_HEAP_HARD_REJECT_MB || '400', 10);
+  if (!Number.isFinite(parsed)) return 400;
+  return Math.max(160, Math.min(1400, parsed));
+})();
 const TRAFFIC_TODAY_DEFAULT_SERVICE_DAYS = 2;
 const TRAFFIC_TODAY_MAX_SERVICE_DAYS = 21;
 const TRAFFIC_TODAY_ABSOLUTE_SAFE_MAX_SERVICE_DAYS = 7;
@@ -186,6 +214,8 @@ let trafficTodayCache = new Map();
 const trafficTodayInFlight = new Map();
 let trafficDayWindowCache = new Map();
 const trafficDayWindowInFlight = new Map();
+let activeTrafficHeavyReads = 0;
+const trafficHeavyReadQueue = [];
 
 const getTrafficTodayCacheKey = (serviceDays) => `serviceDays:${serviceDays}`;
 const getTrafficDayWindowCacheKey = (centerDay, radiusDays) => `day:${centerDay}|radius:${radiusDays}`;
@@ -220,6 +250,112 @@ const setTrafficTodayCachePayload = (cacheKey, payload) => {
 const invalidateTrafficTodayCache = () => {
   trafficTodayCache.clear();
   trafficDayWindowCache.clear();
+};
+
+const getHeapUsedMb = () => {
+  const heapUsed = process.memoryUsage?.().heapUsed;
+  if (!Number.isFinite(heapUsed)) return 0;
+  return Math.round(heapUsed / (1024 * 1024));
+};
+
+const shouldHardRejectForMemory = () => getHeapUsedMb() >= TRAFFIC_HEAP_HARD_REJECT_MB;
+const isSoftMemoryPressure = () => getHeapUsedMb() >= TRAFFIC_HEAP_SOFT_LIMIT_MB;
+
+const promoteTrafficHeavyReadQueue = () => {
+  while (activeTrafficHeavyReads < TRAFFIC_HEAVY_READ_MAX_CONCURRENCY && trafficHeavyReadQueue.length > 0) {
+    const entry = trafficHeavyReadQueue.shift();
+    if (!entry) break;
+    if (entry.timeout) {
+      clearTimeout(entry.timeout);
+    }
+    activeTrafficHeavyReads += 1;
+    const waitedMs = Date.now() - entry.enqueuedAt;
+    entry.resolve({
+      release: (() => {
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          activeTrafficHeavyReads = Math.max(0, activeTrafficHeavyReads - 1);
+          promoteTrafficHeavyReadQueue();
+        };
+      })(),
+      waitedMs
+    });
+  }
+};
+
+const acquireTrafficHeavyReadSlot = async (label) => {
+  if (activeTrafficHeavyReads < TRAFFIC_HEAVY_READ_MAX_CONCURRENCY) {
+    activeTrafficHeavyReads += 1;
+    return {
+      release: (() => {
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          activeTrafficHeavyReads = Math.max(0, activeTrafficHeavyReads - 1);
+          promoteTrafficHeavyReadQueue();
+        };
+      })(),
+      waitedMs: 0
+    };
+  }
+
+  return await new Promise((resolve, reject) => {
+    const queueEntry = {
+      label,
+      enqueuedAt: Date.now(),
+      resolve,
+      reject,
+      timeout: null
+    };
+
+    queueEntry.timeout = setTimeout(() => {
+      const queueIndex = trafficHeavyReadQueue.indexOf(queueEntry);
+      if (queueIndex >= 0) {
+        trafficHeavyReadQueue.splice(queueIndex, 1);
+      }
+      const error = new Error(
+        `Heavy read queue timeout after ${TRAFFIC_HEAVY_READ_WAIT_TIMEOUT_MS}ms for ${label}`
+      );
+      error.code = 'HEAVY_READ_QUEUE_TIMEOUT';
+      reject(error);
+    }, TRAFFIC_HEAVY_READ_WAIT_TIMEOUT_MS);
+
+    trafficHeavyReadQueue.push(queueEntry);
+    console.warn(
+      `⏳ Heavy read queued (${label}): active=${activeTrafficHeavyReads}, ` +
+      `queue=${trafficHeavyReadQueue.length}, max=${TRAFFIC_HEAVY_READ_MAX_CONCURRENCY}`
+    );
+  });
+};
+
+const runTrafficHeavyRead = async (label, fn) => {
+  if (isSoftMemoryPressure()) {
+    console.warn(`⚠️ Memory pressure (soft ${getHeapUsedMb()}MB). Clearing traffic response caches before ${label}`);
+    invalidateTrafficTodayCache();
+  }
+  if (shouldHardRejectForMemory()) {
+    const error = new Error(`Memory pressure hard reject before ${label}: heap=${getHeapUsedMb()}MB`);
+    error.code = 'MEMORY_PRESSURE_HARD_REJECT';
+    throw error;
+  }
+
+  const slot = await acquireTrafficHeavyReadSlot(label);
+  if (slot.waitedMs > 0) {
+    console.log(`⏱️ Heavy read slot acquired for ${label} after waiting ${slot.waitedMs}ms`);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    slot.release();
+    if (isSoftMemoryPressure()) {
+      console.warn(`⚠️ Memory pressure (soft ${getHeapUsedMb()}MB) after ${label}. Clearing traffic response caches.`);
+      invalidateTrafficTodayCache();
+    }
+  }
 };
 
 const getTrafficDayWindowCachePayload = (cacheKey) => {
@@ -1493,7 +1629,12 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     segments: Object.keys(segmentData).length,
     intervals: trafficIntervals.length,
-    collecting: isCollecting
+    collecting: isCollecting,
+    heapUsedMb: getHeapUsedMb(),
+    activeTrafficHeavyReads,
+    queuedTrafficHeavyReads: trafficHeavyReadQueue.length,
+    trafficTodayCacheEntries: trafficTodayCache.size,
+    trafficDayWindowCacheEntries: trafficDayWindowCache.size
   });
 });
 
@@ -1571,7 +1712,10 @@ app.get('/api/traffic/window', async (req, res) => {
 
     try {
       console.log(`📊 API Request: /api/traffic/window centerDay=${centerDayRaw} radius=${radiusDays}`);
-      const dbData = await db.getTrafficDataForDayWindow(centerDayRaw, radiusDays);
+      const dbData = await runTrafficHeavyRead(
+        '/api/traffic/window',
+        () => db.getTrafficDataForDayWindow(centerDayRaw, radiusDays)
+      );
       if (!dbData) {
         res.status(500).json({
           error: 'Failed to fetch day-window traffic data'
@@ -1613,6 +1757,15 @@ app.get('/api/traffic/window', async (req, res) => {
       }
     }
   } catch (error) {
+    if (error?.code === 'MEMORY_PRESSURE_HARD_REJECT' || error?.code === 'HEAVY_READ_QUEUE_TIMEOUT') {
+      console.warn(`⚠️ /api/traffic/window degraded response: ${error.code} (${error.message})`);
+      res.set('Retry-After', '5');
+      res.status(503).json({
+        error: 'Traffic day-window temporarily unavailable; please retry in a few seconds.',
+        code: error.code
+      });
+      return;
+    }
     console.error('❌ Error in /api/traffic/window:', error);
     res.status(500).json({
       error: 'Failed to fetch traffic day-window',
@@ -1691,7 +1844,10 @@ app.get('/api/traffic/today', async (req, res) => {
           const memoryDataAgeMs = Number.isFinite(latestMemoryIntervalMs)
             ? Math.max(0, Date.now() - latestMemoryIntervalMs)
             : null;
-          const dbData = await db.getTodayTrafficData(requestedServiceDays);
+          const dbData = await runTrafficHeavyRead(
+            '/api/traffic/today',
+            () => db.getTodayTrafficData(requestedServiceDays)
+          );
           console.log(`🔍 DB data received: intervals=${dbData?.intervals?.length || 0}, segments=${Object.keys(dbData?.segments || {}).length}`);
           
           if (dbData && dbData.intervals.length > 0) {
@@ -1783,8 +1939,12 @@ app.get('/api/traffic/today', async (req, res) => {
             console.log('📊 No database data found (empty intervals), falling back to memory...');
           }
         } catch (dbError) {
-          console.error('❌ Database read error, falling back to memory:', dbError.message);
-          console.error('❌ Full database read error:', dbError);
+          if (dbError?.code === 'MEMORY_PRESSURE_HARD_REJECT' || dbError?.code === 'HEAVY_READ_QUEUE_TIMEOUT') {
+            console.warn(`⚠️ Skipping DB read for /api/traffic/today (${dbError.code}); falling back to memory.`);
+          } else {
+            console.error('❌ Database read error, falling back to memory:', dbError.message);
+            console.error('❌ Full database read error:', dbError);
+          }
         }
       }
       
@@ -2066,6 +2226,12 @@ const startServer = async () => {
     console.log(`🌐 Server running on port ${PORT}`);
     console.log(`📍 Monitoring ${NORTH_VAN_ROADS.length} major roads with ${Object.keys(segmentData).length} segments`);
     console.log(`🔑 HERE API: ${HERE_API_KEY !== 'YOUR_HERE_API_KEY_NEEDED' ? 'Configured' : 'Not configured'}`);
+    console.log(
+      `🛡️ Read guard: concurrency=${TRAFFIC_HEAVY_READ_MAX_CONCURRENCY}, ` +
+      `waitTimeoutMs=${TRAFFIC_HEAVY_READ_WAIT_TIMEOUT_MS}, heapSoft=${TRAFFIC_HEAP_SOFT_LIMIT_MB}MB, ` +
+      `heapHard=${TRAFFIC_HEAP_HARD_REJECT_MB}MB, cacheToday=${TRAFFIC_TODAY_CACHE_MAX_KEYS}, ` +
+      `cacheWindow=${TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS}`
+    );
   });
 };
 
