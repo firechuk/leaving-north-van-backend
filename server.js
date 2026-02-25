@@ -144,6 +144,16 @@ const TRAFFIC_STATS_STATUS_THRESHOLDS = {
   moderate: 0.42,
   heavy: 0.28
 };
+const TRAFFIC_STATS_COMMUTE_WINDOWS = {
+  morning: {
+    startMinutes: 6 * 60,
+    endMinutes: 10 * 60
+  },
+  afternoon: {
+    startMinutes: 15 * 60,
+    endMinutes: 19 * 60
+  }
+};
 const BRIDGE_CORRIDORS = {
   lionsGate: {
     minLng: -123.152,
@@ -1010,9 +1020,29 @@ const calculateAverageFromSeries = (series = [], ratioKey = 'overallRatio') => {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 };
 
-const calculateBestEscapeWindow = (series = [], ratioKey = 'overallRatio') => {
+const isMinutesInTrafficWindow = (minutesOfDay, timeWindow) => {
+  if (!timeWindow || typeof timeWindow !== 'object') return true;
+  const startMinutes = Number(timeWindow.startMinutes);
+  const endMinutes = Number(timeWindow.endMinutes);
+  if (!Number.isFinite(startMinutes) || !Number.isFinite(endMinutes)) return true;
+  if (!Number.isFinite(minutesOfDay)) return false;
+  if (startMinutes === endMinutes) return true;
+  if (startMinutes < endMinutes) {
+    return minutesOfDay >= startMinutes && minutesOfDay < endMinutes;
+  }
+  // Support overnight windows if needed.
+  return minutesOfDay >= startMinutes || minutesOfDay < endMinutes;
+};
+
+const calculateBestEscapeWindow = (series = [], ratioKey = 'overallRatio', timeWindow = null) => {
   const samples = (Array.isArray(series) ? series : [])
-    .filter((entry) => clampTrafficRatio(entry?.[ratioKey]) !== null);
+    .filter((entry) => {
+      const ratio = clampTrafficRatio(entry?.[ratioKey]);
+      if (ratio === null) return false;
+      if (!timeWindow) return true;
+      const minutesOfDay = getLocalMinutesOfDayInCollectionZone(entry?.timestampMs);
+      return isMinutesInTrafficWindow(minutesOfDay, timeWindow);
+    });
   if (samples.length === 0) return null;
 
   const desiredWindowSamples = Math.max(
@@ -1046,6 +1076,11 @@ const calculateBestEscapeWindow = (series = [], ratioKey = 'overallRatio') => {
     statusLevel: getTrafficStatusLevelFromRatio(best.averageRatio)
   };
 };
+
+const calculateCommuteEscapeWindows = (series = [], ratioKey = 'overallRatio') => ({
+  morning: calculateBestEscapeWindow(series, ratioKey, TRAFFIC_STATS_COMMUTE_WINDOWS.morning),
+  afternoon: calculateBestEscapeWindow(series, ratioKey, TRAFFIC_STATS_COMMUTE_WINDOWS.afternoon)
+});
 
 const calculateWorstCongestionMoment = (series = [], ratioKey = 'overallRatio') => {
   const samples = (Array.isArray(series) ? series : [])
@@ -1178,6 +1213,11 @@ const buildDailyTrafficStatsSummary = (dayKey, intervals = [], segments = {}) =>
       overall: calculateBestEscapeWindow(series, 'overallRatio'),
       lionsGate: calculateBestEscapeWindow(series, 'lionsGateRatio'),
       ironworkers: calculateBestEscapeWindow(series, 'ironworkersRatio')
+    },
+    best30MinuteCommuteEscapeWindows: {
+      overall: calculateCommuteEscapeWindows(series, 'overallRatio'),
+      lionsGate: calculateCommuteEscapeWindows(series, 'lionsGateRatio'),
+      ironworkers: calculateCommuteEscapeWindows(series, 'ironworkersRatio')
     },
     worstCongestionMoment: {
       overall: calculateWorstCongestionMoment(series, 'overallRatio'),
