@@ -794,6 +794,171 @@ class TrafficDatabase {
     calculateIntervalIndex(date) {
         return getServiceIntervalIndex(date);
     }
+
+    async getRecentDateKeys(limit = 90, beforeDayKey = null, includeBeforeDay = true) {
+        try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
+
+            const normalizedLimit = Math.max(1, Math.min(365, Number(limit) || 90));
+            const values = [];
+            let whereClause = '';
+
+            if (beforeDayKey) {
+                const parsedBeforeDay = parseDayKey(beforeDayKey);
+                if (parsedBeforeDay) {
+                    const normalizedBeforeDay = formatDayKeyFromParts(
+                        parsedBeforeDay.year,
+                        parsedBeforeDay.month,
+                        parsedBeforeDay.day
+                    );
+                    values.push(normalizedBeforeDay);
+                    whereClause = `WHERE date_key ${includeBeforeDay ? '<=' : '<'} $1`;
+                }
+            }
+
+            values.push(normalizedLimit);
+            const limitPlaceholder = `$${values.length}`;
+            const query = `
+                SELECT DISTINCT date_key
+                FROM traffic_snapshots
+                ${whereClause}
+                ORDER BY date_key DESC
+                LIMIT ${limitPlaceholder};
+            `;
+
+            const result = await this.pool.query(query, values);
+            return result.rows
+                .map((row) => String(row?.date_key || '').trim())
+                .filter((dateKey) => !!parseDayKey(dateKey));
+        } catch (error) {
+            console.error('❌ Failed to fetch recent date keys:', error);
+            return [];
+        }
+    }
+
+    async getTrafficDataForDateKeys(dayKeys = []) {
+        try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
+
+            const normalizedDayKeys = [...new Set(
+                (Array.isArray(dayKeys) ? dayKeys : [])
+                    .map((value) => String(value || '').trim())
+                    .map((value) => {
+                        const parsed = parseDayKey(value);
+                        if (!parsed) return null;
+                        return formatDayKeyFromParts(parsed.year, parsed.month, parsed.day);
+                    })
+                    .filter(Boolean)
+            )];
+
+            if (normalizedDayKeys.length === 0) {
+                return {
+                    dayKeys: [],
+                    days: {},
+                    recordCount: 0
+                };
+            }
+
+            const query = `
+                SELECT date_key, observed_at, raw_data
+                FROM traffic_snapshots
+                WHERE date_key = ANY($1::text[])
+                ORDER BY date_key ASC, observed_at ASC;
+            `;
+            const result = await this.pool.query(query, [normalizedDayKeys]);
+
+            const dayEntries = {};
+            const observedSegmentIdsByDay = {};
+            normalizedDayKeys.forEach((dayKey) => {
+                dayEntries[dayKey] = {
+                    intervals: [],
+                    segments: {},
+                    counterFlow: {},
+                    recordCount: 0,
+                    validRecords: 0,
+                    corruptedRecords: 0
+                };
+                observedSegmentIdsByDay[dayKey] = new Set();
+            });
+
+            let rewrittenTimestampCount = 0;
+
+            result.rows.forEach((row) => {
+                const dayKey = String(row?.date_key || '').trim();
+                if (!dayEntries[dayKey]) return;
+
+                dayEntries[dayKey].recordCount += 1;
+                try {
+                    const snapshot = JSON.parse(row.raw_data);
+                    const intervalData = snapshot.intervalData && typeof snapshot.intervalData === 'object'
+                        ? { ...snapshot.intervalData }
+                        : null;
+
+                    if (intervalData) {
+                        const observedAtIso = normalizeObservedAtTimestamp(row.observed_at);
+                        if (observedAtIso && intervalData.timestamp !== observedAtIso) {
+                            intervalData.timestamp = observedAtIso;
+                            rewrittenTimestampCount += 1;
+                        }
+                        dayEntries[dayKey].intervals.push(intervalData);
+                        extractSegmentIdsFromInterval(intervalData).forEach((segmentId) => {
+                            observedSegmentIdsByDay[dayKey].add(segmentId);
+                        });
+                        dayEntries[dayKey].validRecords += 1;
+                    }
+
+                    if (snapshot.segmentData && typeof snapshot.segmentData === 'object') {
+                        Object.assign(dayEntries[dayKey].segments, snapshot.segmentData);
+                    }
+                    if (snapshot.counterFlowData && typeof snapshot.counterFlowData === 'object') {
+                        dayEntries[dayKey].counterFlow = snapshot.counterFlowData;
+                    }
+                } catch (parseError) {
+                    dayEntries[dayKey].corruptedRecords += 1;
+                }
+            });
+
+            const globalMissingSegmentIds = new Set();
+            normalizedDayKeys.forEach((dayKey) => {
+                observedSegmentIdsByDay[dayKey].forEach((segmentId) => {
+                    if (!dayEntries[dayKey].segments[segmentId]) {
+                        globalMissingSegmentIds.add(segmentId);
+                    }
+                });
+            });
+
+            let catalogSegments = {};
+            if (globalMissingSegmentIds.size > 0) {
+                catalogSegments = await this.getSegmentMetadataByIds([...globalMissingSegmentIds]);
+            }
+
+            normalizedDayKeys.forEach((dayKey) => {
+                observedSegmentIdsByDay[dayKey].forEach((segmentId) => {
+                    if (!dayEntries[dayKey].segments[segmentId] && catalogSegments[segmentId]) {
+                        dayEntries[dayKey].segments[segmentId] = catalogSegments[segmentId];
+                    }
+                });
+            });
+
+            console.log(
+                `✅ DB multi-day read success: days=${normalizedDayKeys.length}, rows=${result.rows.length}, ` +
+                `rewrittenTimestamps=${rewrittenTimestampCount}, missingCatalogLoaded=${Object.keys(catalogSegments).length}`
+            );
+
+            return {
+                dayKeys: normalizedDayKeys,
+                days: dayEntries,
+                recordCount: result.rows.length
+            };
+        } catch (error) {
+            console.error('❌ Failed to get traffic data for date keys:', error);
+            return null;
+        }
+    }
     
     // Get database statistics
     async getStats() {

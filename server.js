@@ -114,7 +114,36 @@ const trafficCollectionHourFormatter = new Intl.DateTimeFormat('en-US', {
   hour12: false,
   hourCycle: 'h23'
 });
+const trafficCollectionMinuteFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: TRAFFIC_COLLECTION_TIME_ZONE,
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+  hourCycle: 'h23'
+});
+const trafficCollectionDayFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TRAFFIC_COLLECTION_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit'
+});
 const MIN_FILTERED_SEGMENTS_FOR_TRACKED = 12;
+const TRAFFIC_STATS_CACHE_TTL_MS = 2 * 60 * 1000;
+const TRAFFIC_STATS_CACHE_MAX_KEYS = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_STATS_CACHE_MAX_KEYS || '18', 10);
+  if (!Number.isFinite(parsed)) return 18;
+  return Math.max(4, Math.min(60, parsed));
+})();
+const TRAFFIC_STATS_MAX_LOOKBACK_WEEKS = 20;
+const TRAFFIC_STATS_DEFAULT_LOOKBACK_WEEKS = 8;
+const TRAFFIC_STATS_DEFAULT_MAX_SAME_WEEKDAY_SAMPLES = 8;
+const TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES = 2;
+const TRAFFIC_STATS_WINDOW_MINUTES = 30;
+const TRAFFIC_STATS_STATUS_THRESHOLDS = {
+  freeFlow: 0.55,
+  moderate: 0.42,
+  heavy: 0.28
+};
 const BRIDGE_CORRIDORS = {
   lionsGate: {
     minLng: -123.152,
@@ -214,11 +243,15 @@ let trafficTodayCache = new Map();
 const trafficTodayInFlight = new Map();
 let trafficDayWindowCache = new Map();
 const trafficDayWindowInFlight = new Map();
+let trafficStatsCache = new Map();
+const trafficStatsInFlight = new Map();
 let activeTrafficHeavyReads = 0;
 const trafficHeavyReadQueue = [];
 
 const getTrafficTodayCacheKey = (serviceDays) => `serviceDays:${serviceDays}`;
 const getTrafficDayWindowCacheKey = (centerDay, radiusDays) => `day:${centerDay}|radius:${radiusDays}`;
+const getTrafficStatsCacheKey = (dayKey, lookbackWeeks, maxSamples) =>
+  `stats:${dayKey}|lookback:${lookbackWeeks}|samples:${maxSamples}`;
 
 const getTrafficTodayCachePayload = (cacheKey) => {
   const cacheEntry = trafficTodayCache.get(cacheKey);
@@ -250,6 +283,7 @@ const setTrafficTodayCachePayload = (cacheKey, payload) => {
 const invalidateTrafficTodayCache = () => {
   trafficTodayCache.clear();
   trafficDayWindowCache.clear();
+  trafficStatsCache.clear();
 };
 
 const getHeapUsedMb = () => {
@@ -381,6 +415,32 @@ const setTrafficDayWindowCachePayload = (cacheKey, payload) => {
     const oldestKey = trafficDayWindowCache.keys().next().value;
     if (!oldestKey) break;
     trafficDayWindowCache.delete(oldestKey);
+  }
+};
+
+const getTrafficStatsCachePayload = (cacheKey) => {
+  const cacheEntry = trafficStatsCache.get(cacheKey);
+  if (!cacheEntry) return null;
+  if (Date.now() >= cacheEntry.expiresAt) {
+    trafficStatsCache.delete(cacheKey);
+    return null;
+  }
+  return cacheEntry.payload;
+};
+
+const setTrafficStatsCachePayload = (cacheKey, payload) => {
+  if (trafficStatsCache.has(cacheKey)) {
+    trafficStatsCache.delete(cacheKey);
+  }
+  trafficStatsCache.set(cacheKey, {
+    expiresAt: Date.now() + TRAFFIC_STATS_CACHE_TTL_MS,
+    payload
+  });
+
+  while (trafficStatsCache.size > TRAFFIC_STATS_CACHE_MAX_KEYS) {
+    const oldestKey = trafficStatsCache.keys().next().value;
+    if (!oldestKey) break;
+    trafficStatsCache.delete(oldestKey);
   }
 };
 
@@ -749,6 +809,474 @@ const parseIntervalTimestampMs = (interval) => {
 
   const parsedMs = Date.parse(String(rawTimestamp));
   return Number.isFinite(parsedMs) ? parsedMs : null;
+};
+
+const parseTrafficDayKey = (dayKey) => {
+  if (typeof dayKey !== 'string') return null;
+  const match = dayKey.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const candidate = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+  if (
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() + 1 !== month ||
+    candidate.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return { year, month, day };
+};
+
+const formatTrafficDayKey = (year, month, day) =>
+  `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+const getTrafficServiceDayKey = (date = new Date()) => {
+  const parts = trafficCollectionDayFormatter.formatToParts(date);
+  const values = {};
+  parts.forEach((part) => {
+    if (part.type !== 'literal') values[part.type] = part.value;
+  });
+  const year = Number(values.year);
+  const month = Number(values.month);
+  const day = Number(values.day);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    const fallback = new Date(date);
+    return formatTrafficDayKey(
+      fallback.getUTCFullYear(),
+      fallback.getUTCMonth() + 1,
+      fallback.getUTCDate()
+    );
+  }
+  return formatTrafficDayKey(year, month, day);
+};
+
+const getTrafficServiceDayKeyFromTimestampMs = (timestampMs) => {
+  if (!Number.isFinite(timestampMs)) return null;
+  return getTrafficServiceDayKey(new Date(timestampMs));
+};
+
+const getDayOfWeekFromTrafficDayKey = (dayKey) => {
+  const parsed = parseTrafficDayKey(dayKey);
+  if (!parsed) return null;
+  return new Date(Date.UTC(parsed.year, parsed.month - 1, parsed.day, 12, 0, 0)).getUTCDay();
+};
+
+const getWeekdayLabelFromTrafficDayKey = (dayKey) => {
+  const parsed = parseTrafficDayKey(dayKey);
+  if (!parsed) return null;
+  return new Date(Date.UTC(parsed.year, parsed.month - 1, parsed.day, 12, 0, 0))
+    .toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+};
+
+const clampTrafficRatio = (value) => {
+  const ratio = Number(value);
+  if (!Number.isFinite(ratio)) return null;
+  return Math.max(0, Math.min(1, ratio));
+};
+
+const getTrafficStatusLevelFromRatio = (ratio) => {
+  const normalized = clampTrafficRatio(ratio);
+  if (normalized === null) return 'unknown';
+  if (normalized > TRAFFIC_STATS_STATUS_THRESHOLDS.freeFlow) return 'free';
+  if (normalized > TRAFFIC_STATS_STATUS_THRESHOLDS.moderate) return 'moderate';
+  if (normalized > TRAFFIC_STATS_STATUS_THRESHOLDS.heavy) return 'heavy';
+  return 'gridlock';
+};
+
+const getLocalMinutesOfDayInCollectionZone = (timestampMs) => {
+  if (!Number.isFinite(timestampMs)) return null;
+  const parts = trafficCollectionMinuteFormatter.formatToParts(new Date(timestampMs));
+  const values = {};
+  parts.forEach((part) => {
+    if (part.type !== 'literal') values[part.type] = part.value;
+  });
+  const hour = Number(values.hour);
+  const minute = Number(values.minute);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  return (hour * 60) + minute;
+};
+
+const isRushHourMinutes = (minutesOfDay) => {
+  if (!Number.isFinite(minutesOfDay)) return false;
+  const isMorningRush = minutesOfDay >= (6 * 60) && minutesOfDay < (10 * 60);
+  const isEveningRush = minutesOfDay >= (15 * 60) && minutesOfDay < (19 * 60);
+  return isMorningRush || isEveningRush;
+};
+
+const getTrafficAverageRatioForSegments = (interval, segmentIds = []) => {
+  if (!interval || typeof interval !== 'object') return null;
+  if (!Array.isArray(segmentIds) || segmentIds.length === 0) return null;
+
+  let sum = 0;
+  let count = 0;
+  segmentIds.forEach((segmentId) => {
+    const ratio = clampTrafficRatio(interval[segmentId]);
+    if (ratio === null) return;
+    sum += ratio;
+    count += 1;
+  });
+
+  return count > 0 ? (sum / count) : null;
+};
+
+const getCoordinatesForBridgeHint = (rawCoordinates) => {
+  if (Array.isArray(rawCoordinates)) return rawCoordinates;
+  if (typeof rawCoordinates === 'string') {
+    try {
+      const parsed = JSON.parse(rawCoordinates);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_error) {
+      return [];
+    }
+  }
+  return [];
+};
+
+const resolveBridgeTypeFromSegment = (segmentId, segment) => {
+  const hint = String(segment?.bridgeHint || '').trim().toLowerCase();
+  if (hint === 'lions-gate' || hint === 'lions gate' || hint === 'lionsgate') return 'lions-gate';
+  if (
+    hint === 'ironworkers' ||
+    hint === 'iron workers' ||
+    hint === 'second-narrows' ||
+    hint === 'second narrows'
+  ) {
+    return 'ironworkers';
+  }
+
+  const descriptionParts = [
+    segmentId,
+    segment?.name,
+    segment?.description,
+    segment?.hereReference
+  ].filter((value) => typeof value === 'string' && value.trim().length > 0);
+  const description = descriptionParts.join(' ').trim();
+  const coordinates = getCoordinatesForBridgeHint(segment?.coordinates);
+  return inferBridgeHint(description, coordinates);
+};
+
+const buildTrafficIntervalSeries = (intervals = [], segments = {}) => {
+  const resolvedIntervals = (Array.isArray(intervals) ? intervals : [])
+    .map((interval) => ({
+      interval,
+      timestampMs: parseIntervalTimestampMs(interval)
+    }))
+    .filter((entry) => Number.isFinite(entry.timestampMs))
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+
+  const allSegmentIdsSet = new Set();
+  resolvedIntervals.forEach(({ interval }) => {
+    Object.keys(interval || {}).forEach((key) => {
+      if (key && key !== 'timestamp') allSegmentIdsSet.add(key);
+    });
+  });
+
+  const allSegmentIds = [...allSegmentIdsSet];
+  const lionsGateSegmentIds = [];
+  const ironworkersSegmentIds = [];
+
+  allSegmentIds.forEach((segmentId) => {
+    const bridgeType = resolveBridgeTypeFromSegment(segmentId, segments?.[segmentId]);
+    if (bridgeType === 'lions-gate') lionsGateSegmentIds.push(segmentId);
+    if (bridgeType === 'ironworkers') ironworkersSegmentIds.push(segmentId);
+  });
+
+  const series = resolvedIntervals.map(({ interval, timestampMs }) => ({
+    timestampMs,
+    overallRatio: getTrafficAverageRatioForSegments(interval, allSegmentIds),
+    lionsGateRatio: getTrafficAverageRatioForSegments(interval, lionsGateSegmentIds),
+    ironworkersRatio: getTrafficAverageRatioForSegments(interval, ironworkersSegmentIds)
+  }));
+
+  return {
+    series,
+    segmentCounts: {
+      overall: allSegmentIds.length,
+      lionsGate: lionsGateSegmentIds.length,
+      ironworkers: ironworkersSegmentIds.length
+    }
+  };
+};
+
+const calculateAverageFromSeries = (series = [], ratioKey = 'overallRatio') => {
+  const values = [];
+  (Array.isArray(series) ? series : []).forEach((entry) => {
+    const ratio = clampTrafficRatio(entry?.[ratioKey]);
+    if (ratio !== null) values.push(ratio);
+  });
+  if (values.length === 0) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+};
+
+const calculateBestEscapeWindow = (series = [], ratioKey = 'overallRatio') => {
+  const samples = (Array.isArray(series) ? series : [])
+    .filter((entry) => clampTrafficRatio(entry?.[ratioKey]) !== null);
+  if (samples.length === 0) return null;
+
+  const desiredWindowSamples = Math.max(
+    1,
+    Math.round(TRAFFIC_STATS_WINDOW_MINUTES / TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES)
+  );
+  const windowSamples = Math.min(desiredWindowSamples, samples.length);
+
+  let best = null;
+  for (let i = 0; i <= samples.length - windowSamples; i += 1) {
+    const window = samples.slice(i, i + windowSamples);
+    let sum = 0;
+    window.forEach((entry) => {
+      sum += clampTrafficRatio(entry[ratioKey]) || 0;
+    });
+    const averageRatio = sum / window.length;
+    if (!best || averageRatio > best.averageRatio) {
+      best = {
+        averageRatio,
+        startTimestampMs: window[0].timestampMs,
+        endTimestampMs: window[window.length - 1].timestampMs,
+        windowMinutes: window.length * TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES,
+        sampleCount: window.length
+      };
+    }
+  }
+
+  if (!best) return null;
+  return {
+    ...best,
+    statusLevel: getTrafficStatusLevelFromRatio(best.averageRatio)
+  };
+};
+
+const calculateWorstCongestionMoment = (series = [], ratioKey = 'overallRatio') => {
+  const samples = (Array.isArray(series) ? series : [])
+    .map((entry) => ({
+      timestampMs: entry?.timestampMs,
+      ratio: clampTrafficRatio(entry?.[ratioKey])
+    }))
+    .filter((entry) => Number.isFinite(entry.timestampMs) && entry.ratio !== null);
+  if (samples.length === 0) return null;
+
+  let worstIndex = 0;
+  for (let i = 1; i < samples.length; i += 1) {
+    if (samples[i].ratio < samples[worstIndex].ratio) {
+      worstIndex = i;
+    }
+  }
+
+  const worst = samples[worstIndex];
+  const recoveryThreshold = TRAFFIC_STATS_STATUS_THRESHOLDS.freeFlow;
+  let recoveredAtTimestampMs = null;
+  for (let i = worstIndex + 1; i < samples.length; i += 1) {
+    if (samples[i].ratio >= recoveryThreshold) {
+      recoveredAtTimestampMs = samples[i].timestampMs;
+      break;
+    }
+  }
+
+  const recoveryMinutesToFreeFlow = Number.isFinite(recoveredAtTimestampMs)
+    ? Math.max(0, Math.round((recoveredAtTimestampMs - worst.timestampMs) / (60 * 1000)))
+    : null;
+
+  return {
+    timestampMs: worst.timestampMs,
+    ratio: worst.ratio,
+    statusLevel: getTrafficStatusLevelFromRatio(worst.ratio),
+    recoveredAtTimestampMs,
+    recoveryMinutesToFreeFlow
+  };
+};
+
+const calculateRushHourPainMinutes = (series = [], ratioKey = 'overallRatio') => {
+  const totals = {
+    moderate: 0,
+    heavy: 0,
+    gridlock: 0,
+    total: 0
+  };
+
+  (Array.isArray(series) ? series : []).forEach((entry) => {
+    const ratio = clampTrafficRatio(entry?.[ratioKey]);
+    if (ratio === null) return;
+    const minutesOfDay = getLocalMinutesOfDayInCollectionZone(entry.timestampMs);
+    if (!isRushHourMinutes(minutesOfDay)) return;
+
+    const statusLevel = getTrafficStatusLevelFromRatio(ratio);
+    if (statusLevel === 'moderate' || statusLevel === 'heavy' || statusLevel === 'gridlock') {
+      totals[statusLevel] += TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES;
+      totals.total += TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES;
+    }
+  });
+
+  return totals;
+};
+
+const calculateBridgeBattle = (lionsGateAverageRatio, ironworkersAverageRatio) => {
+  const lionsScore = clampTrafficRatio(lionsGateAverageRatio);
+  const ironScore = clampTrafficRatio(ironworkersAverageRatio);
+  if (lionsScore === null && ironScore === null) {
+    return {
+      winner: 'no-data',
+      lionsGateScore: null,
+      ironworkersScore: null,
+      scoreDelta: null
+    };
+  }
+  if (lionsScore !== null && ironScore === null) {
+    return {
+      winner: 'lions-gate',
+      lionsGateScore: Math.round(lionsScore * 1000) / 10,
+      ironworkersScore: null,
+      scoreDelta: null
+    };
+  }
+  if (lionsScore === null && ironScore !== null) {
+    return {
+      winner: 'ironworkers',
+      lionsGateScore: null,
+      ironworkersScore: Math.round(ironScore * 1000) / 10,
+      scoreDelta: null
+    };
+  }
+
+  const delta = lionsScore - ironScore;
+  const winner = Math.abs(delta) < 0.005
+    ? 'tie'
+    : (delta > 0 ? 'lions-gate' : 'ironworkers');
+
+  return {
+    winner,
+    lionsGateScore: Math.round(lionsScore * 1000) / 10,
+    ironworkersScore: Math.round(ironScore * 1000) / 10,
+    scoreDelta: Math.round(delta * 1000) / 10
+  };
+};
+
+const buildDailyTrafficStatsSummary = (dayKey, intervals = [], segments = {}) => {
+  const { series, segmentCounts } = buildTrafficIntervalSeries(intervals, segments);
+
+  const overallAverageRatio = calculateAverageFromSeries(series, 'overallRatio');
+  const lionsGateAverageRatio = calculateAverageFromSeries(series, 'lionsGateRatio');
+  const ironworkersAverageRatio = calculateAverageFromSeries(series, 'ironworkersRatio');
+
+  const firstTimestampMs = series.length > 0 ? series[0].timestampMs : null;
+  const lastTimestampMs = series.length > 0 ? series[series.length - 1].timestampMs : null;
+
+  return {
+    dayKey,
+    weekday: getWeekdayLabelFromTrafficDayKey(dayKey),
+    hasData: series.length > 0,
+    intervalCount: series.length,
+    segmentCounts,
+    firstTimestampMs,
+    lastTimestampMs,
+    averages: {
+      overallRatio: overallAverageRatio,
+      lionsGateRatio: lionsGateAverageRatio,
+      ironworkersRatio: ironworkersAverageRatio
+    },
+    best30MinuteEscapeWindow: {
+      overall: calculateBestEscapeWindow(series, 'overallRatio'),
+      lionsGate: calculateBestEscapeWindow(series, 'lionsGateRatio'),
+      ironworkers: calculateBestEscapeWindow(series, 'ironworkersRatio')
+    },
+    worstCongestionMoment: {
+      overall: calculateWorstCongestionMoment(series, 'overallRatio'),
+      lionsGate: calculateWorstCongestionMoment(series, 'lionsGateRatio'),
+      ironworkers: calculateWorstCongestionMoment(series, 'ironworkersRatio')
+    },
+    rushHourPainMinutes: {
+      overall: calculateRushHourPainMinutes(series, 'overallRatio'),
+      lionsGate: calculateRushHourPainMinutes(series, 'lionsGateRatio'),
+      ironworkers: calculateRushHourPainMinutes(series, 'ironworkersRatio')
+    },
+    bridgeBattle: calculateBridgeBattle(lionsGateAverageRatio, ironworkersAverageRatio)
+  };
+};
+
+const buildSameWeekdayComparison = (selectedSummary, baselineSummaries = []) => {
+  const usableBaseline = (Array.isArray(baselineSummaries) ? baselineSummaries : [])
+    .filter((summary) => summary?.hasData)
+    .filter((summary) => clampTrafficRatio(summary?.averages?.overallRatio) !== null);
+
+  if (usableBaseline.length === 0) {
+    return {
+      available: false,
+      sampleCount: 0,
+      verdict: 'insufficient-data',
+      baselineAverageRatio: null,
+      selectedAverageRatio: clampTrafficRatio(selectedSummary?.averages?.overallRatio),
+      deltaAverageRatio: null,
+      baselineRushHourPainMinutes: null,
+      selectedRushHourPainMinutes: Number.isFinite(selectedSummary?.rushHourPainMinutes?.overall?.total)
+        ? selectedSummary.rushHourPainMinutes.overall.total
+        : null,
+      deltaRushHourPainMinutes: null,
+      sampleDayKeys: []
+    };
+  }
+
+  const averageRatios = usableBaseline
+    .map((summary) => clampTrafficRatio(summary?.averages?.overallRatio))
+    .filter((value) => value !== null);
+  const painMinutes = usableBaseline
+    .map((summary) => Number(summary?.rushHourPainMinutes?.overall?.total))
+    .filter((value) => Number.isFinite(value));
+
+  const baselineAverageRatio = averageRatios.length > 0
+    ? (averageRatios.reduce((sum, value) => sum + value, 0) / averageRatios.length)
+    : null;
+  const baselineRushHourPainMinutes = painMinutes.length > 0
+    ? (painMinutes.reduce((sum, value) => sum + value, 0) / painMinutes.length)
+    : null;
+
+  const selectedAverageRatio = clampTrafficRatio(selectedSummary?.averages?.overallRatio);
+  const selectedRushHourPainMinutes = Number.isFinite(selectedSummary?.rushHourPainMinutes?.overall?.total)
+    ? selectedSummary.rushHourPainMinutes.overall.total
+    : null;
+
+  const deltaAverageRatio =
+    selectedAverageRatio !== null && baselineAverageRatio !== null
+      ? (selectedAverageRatio - baselineAverageRatio)
+      : null;
+  const deltaRushHourPainMinutes =
+    Number.isFinite(selectedRushHourPainMinutes) && Number.isFinite(baselineRushHourPainMinutes)
+      ? (selectedRushHourPainMinutes - baselineRushHourPainMinutes)
+      : null;
+
+  let verdict = 'about-average';
+  if (deltaAverageRatio !== null || deltaRushHourPainMinutes !== null) {
+    const flowSignal = Number.isFinite(deltaAverageRatio) ? deltaAverageRatio : 0;
+    const painSignal = Number.isFinite(deltaRushHourPainMinutes) ? deltaRushHourPainMinutes : 0;
+    if (flowSignal >= 0.03 && painSignal <= -10) {
+      verdict = 'better-than-usual';
+    } else if (flowSignal <= -0.03 || painSignal >= 10) {
+      verdict = 'worse-than-usual';
+    }
+  }
+
+  return {
+    available: true,
+    sampleCount: usableBaseline.length,
+    verdict,
+    baselineAverageRatio,
+    selectedAverageRatio,
+    deltaAverageRatio,
+    baselineRushHourPainMinutes,
+    selectedRushHourPainMinutes,
+    deltaRushHourPainMinutes,
+    sampleDayKeys: usableBaseline
+      .map((summary) => summary?.dayKey)
+      .filter((value) => typeof value === 'string' && value.length > 0)
+  };
+};
+
+const filterIntervalsByDayKey = (intervals = [], dayKey) => {
+  if (!dayKey) return [];
+  return (Array.isArray(intervals) ? intervals : []).filter((interval) => {
+    const timestampMs = parseIntervalTimestampMs(interval);
+    if (!Number.isFinite(timestampMs)) return false;
+    return getTrafficServiceDayKeyFromTimestampMs(timestampMs) === dayKey;
+  });
 };
 
 const getLatestIntervalTimestampMs = (intervals) => {
@@ -1634,7 +2162,8 @@ app.get('/health', (req, res) => {
     activeTrafficHeavyReads,
     queuedTrafficHeavyReads: trafficHeavyReadQueue.length,
     trafficTodayCacheEntries: trafficTodayCache.size,
-    trafficDayWindowCacheEntries: trafficDayWindowCache.size
+    trafficDayWindowCacheEntries: trafficDayWindowCache.size,
+    trafficStatsCacheEntries: trafficStatsCache.size
   });
 });
 
@@ -2005,6 +2534,187 @@ app.get('/api/traffic/today', async (req, res) => {
     res.status(500).json({ 
       error: 'Failed to fetch traffic data',
       details: error.message 
+    });
+  }
+});
+
+app.get('/api/stats/daily', async (req, res) => {
+  try {
+    const rawDay = String(req.query.day || '').trim();
+    const defaultDayKey = getTrafficServiceDayKey(new Date());
+    const parsedDay = parseTrafficDayKey(rawDay || defaultDayKey);
+    if (!parsedDay) {
+      res.status(400).json({
+        error: 'Missing or invalid day. Expected YYYY-MM-DD.'
+      });
+      return;
+    }
+
+    const dayKey = formatTrafficDayKey(parsedDay.year, parsedDay.month, parsedDay.day);
+    const requestedLookbackWeeks = Number.parseInt(req.query.lookbackWeeks, 10);
+    const lookbackWeeks = Number.isFinite(requestedLookbackWeeks)
+      ? Math.max(1, Math.min(TRAFFIC_STATS_MAX_LOOKBACK_WEEKS, requestedLookbackWeeks))
+      : TRAFFIC_STATS_DEFAULT_LOOKBACK_WEEKS;
+
+    const requestedMaxSamples = Number.parseInt(req.query.maxSamples, 10);
+    const maxSamples = Number.isFinite(requestedMaxSamples)
+      ? Math.max(0, Math.min(12, requestedMaxSamples))
+      : TRAFFIC_STATS_DEFAULT_MAX_SAME_WEEKDAY_SAMPLES;
+
+    const refreshParam = String(req.query.refresh || '').toLowerCase();
+    const bypassCache = refreshParam === '1' || refreshParam === 'true' || refreshParam === 'yes';
+    const cacheKey = getTrafficStatsCacheKey(dayKey, lookbackWeeks, maxSamples);
+
+    if (!bypassCache) {
+      const cachedPayload = getTrafficStatsCachePayload(cacheKey);
+      if (cachedPayload) {
+        res.set('X-Traffic-Stats-Cache', 'HIT');
+        res.json(cachedPayload);
+        return;
+      }
+    }
+    res.set('X-Traffic-Stats-Cache', 'MISS');
+
+    let inFlightGate = null;
+    if (!bypassCache) {
+      const existingInFlight = trafficStatsInFlight.get(cacheKey);
+      if (existingInFlight && existingInFlight.promise) {
+        try {
+          await existingInFlight.promise;
+        } catch (_error) {
+          // Ignore gate wait errors and continue.
+        }
+        const waitedCachePayload = getTrafficStatsCachePayload(cacheKey);
+        if (waitedCachePayload) {
+          res.set('X-Traffic-Stats-Cache', 'WAIT-HIT');
+          res.json(waitedCachePayload);
+          return;
+        }
+      }
+
+      let resolveGate;
+      const gatePromise = new Promise((resolve) => {
+        resolveGate = resolve;
+      });
+      inFlightGate = { promise: gatePromise, resolve: resolveGate };
+      trafficStatsInFlight.set(cacheKey, inFlightGate);
+    }
+
+    try {
+      const responseBase = {
+        dayKey,
+        weekday: getWeekdayLabelFromTrafficDayKey(dayKey),
+        lookbackWeeks,
+        maxSameWeekdaySamples: maxSamples,
+        generatedAt: new Date().toISOString()
+      };
+
+      let selectedSummary = buildDailyTrafficStatsSummary(dayKey, [], {});
+      let baselineSummaries = [];
+      let dataSource = 'memory-ephemeral';
+      let fromDatabase = false;
+
+      if (db) {
+        try {
+          const dbStatsPayload = await runTrafficHeavyRead(
+            `/api/stats/daily:${dayKey}`,
+            async () => {
+              const targetDayOfWeek = getDayOfWeekFromTrafficDayKey(dayKey);
+              const recentDateKeys = await db.getRecentDateKeys((lookbackWeeks * 7) + 28, dayKey, true);
+              const baselineDayKeys = recentDateKeys
+                .filter((candidateDayKey) => candidateDayKey < dayKey)
+                .filter((candidateDayKey) => getDayOfWeekFromTrafficDayKey(candidateDayKey) === targetDayOfWeek)
+                .slice(0, maxSamples);
+
+              const dayKeysToLoad = [dayKey, ...baselineDayKeys];
+              const dbDayData = await db.getTrafficDataForDateKeys(dayKeysToLoad);
+              if (!dbDayData) {
+                throw new Error('Failed to load day stats data from database');
+              }
+
+              const summariesByDayKey = {};
+              dayKeysToLoad.forEach((candidateDayKey) => {
+                const dayEntry = dbDayData?.days?.[candidateDayKey] || {};
+                summariesByDayKey[candidateDayKey] = buildDailyTrafficStatsSummary(
+                  candidateDayKey,
+                  dayEntry.intervals || [],
+                  dayEntry.segments || {}
+                );
+              });
+
+              const selectedFromDb = summariesByDayKey[dayKey] || buildDailyTrafficStatsSummary(dayKey, [], {});
+              const baselineFromDb = baselineDayKeys
+                .map((candidateDayKey) => summariesByDayKey[candidateDayKey])
+                .filter(Boolean);
+
+              return {
+                selectedSummary: selectedFromDb,
+                baselineSummaries: baselineFromDb
+              };
+            }
+          );
+
+          selectedSummary = dbStatsPayload.selectedSummary;
+          baselineSummaries = dbStatsPayload.baselineSummaries;
+          dataSource = 'database';
+          fromDatabase = true;
+        } catch (dbStatsError) {
+          console.warn(`⚠️ /api/stats/daily DB read failed, falling back to memory: ${dbStatsError.message}`);
+        }
+      }
+
+      if (!fromDatabase) {
+        const memoryIntervalsForDay = filterIntervalsByDayKey(trafficIntervals, dayKey);
+        selectedSummary = buildDailyTrafficStatsSummary(dayKey, memoryIntervalsForDay, segmentData);
+      }
+
+      // If DB lacks current-day rows during startup, include fresh in-memory intervals.
+      if (!selectedSummary.hasData && dayKey === getTrafficServiceDayKey(new Date())) {
+        const memoryIntervalsForDay = filterIntervalsByDayKey(trafficIntervals, dayKey);
+        if (memoryIntervalsForDay.length > 0) {
+          selectedSummary = buildDailyTrafficStatsSummary(dayKey, memoryIntervalsForDay, segmentData);
+          dataSource = fromDatabase ? 'hybrid-db-memory' : 'memory-ephemeral';
+        }
+      }
+
+      const sameWeekdayComparison = buildSameWeekdayComparison(selectedSummary, baselineSummaries);
+      const baselineDays = baselineSummaries.map((summary) => ({
+        dayKey: summary.dayKey,
+        weekday: summary.weekday,
+        averageRatio: summary.averages?.overallRatio ?? null,
+        rushHourPainMinutes: summary.rushHourPainMinutes?.overall?.total ?? null
+      }));
+
+      const response = {
+        ...responseBase,
+        dataSource,
+        fromDatabase,
+        summary: selectedSummary,
+        sameWeekdayComparison,
+        baselineDays
+      };
+
+      setTrafficStatsCachePayload(cacheKey, response);
+      res.json(response);
+    } finally {
+      if (inFlightGate && trafficStatsInFlight.get(cacheKey) === inFlightGate) {
+        inFlightGate.resolve();
+        trafficStatsInFlight.delete(cacheKey);
+      }
+    }
+  } catch (error) {
+    if (error?.code === 'MEMORY_PRESSURE_HARD_REJECT' || error?.code === 'HEAVY_READ_QUEUE_TIMEOUT') {
+      res.set('Retry-After', '5');
+      res.status(503).json({
+        error: 'Traffic stats are temporarily unavailable; please retry in a few seconds.',
+        code: error.code
+      });
+      return;
+    }
+    console.error('❌ Error in /api/stats/daily:', error);
+    res.status(500).json({
+      error: 'Failed to build daily stats',
+      details: error.message
     });
   }
 });
