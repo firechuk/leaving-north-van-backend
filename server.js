@@ -90,6 +90,19 @@ const MANUAL_TRACKED_SOURCE_IDS = new Set([
   'here-net-fdc3c855f1a803'
 ]);
 const TRAFFIC_DB_STALE_MAX_AGE_MS = 12 * 60 * 1000;
+const TRAFFIC_STALE_THRESHOLD_MINUTES = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_STALE_THRESHOLD_MINUTES || '12', 10);
+  if (!Number.isFinite(parsed)) return 12;
+  return Math.max(2, Math.min(180, parsed));
+})();
+const TRAFFIC_STALE_THRESHOLD_MS = TRAFFIC_STALE_THRESHOLD_MINUTES * 60 * 1000;
+const TRAFFIC_WATCHDOG_STALE_MINUTES = (() => {
+  const parsed = Number.parseInt(process.env.TRAFFIC_WATCHDOG_STALE_MINUTES || '15', 10);
+  if (!Number.isFinite(parsed)) return 15;
+  return Math.max(3, Math.min(360, parsed));
+})();
+const TRAFFIC_WATCHDOG_STALE_MS = TRAFFIC_WATCHDOG_STALE_MINUTES * 60 * 1000;
+const TRAFFIC_WATCHDOG_INTERVAL_MS = 60 * 1000;
 const TRAFFIC_COLLECTION_TIME_ZONE = 'America/Vancouver';
 const TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES = (() => {
   const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES || '2', 10);
@@ -262,6 +275,11 @@ let trafficStatsCache = new Map();
 const trafficStatsInFlight = new Map();
 let activeTrafficHeavyReads = 0;
 const trafficHeavyReadQueue = [];
+let lastSuccessfulTrafficCollectionAtMs = null;
+let lastTrafficCollectionFailureAtMs = null;
+let consecutiveTrafficCollectionFailures = 0;
+let lastTrafficCollectionFailureMessage = null;
+let lastTrafficWatchdogAlertAtMs = 0;
 
 const getTrafficTodayCacheKey = (serviceDays) => `serviceDays:${serviceDays}`;
 const getTrafficDayWindowCacheKey = (centerDay, radiusDays) => `day:${centerDay}|radius:${radiusDays}`;
@@ -1357,6 +1375,96 @@ const getLatestIntervalTimestampMs = (intervals) => {
   return null;
 };
 
+const buildTrafficFreshness = (intervals, options = {}) => {
+  const staleThresholdMinutes = Number.isFinite(options?.staleThresholdMinutes)
+    ? Math.max(1, Math.round(options.staleThresholdMinutes))
+    : TRAFFIC_STALE_THRESHOLD_MINUTES;
+  const staleThresholdMs = staleThresholdMinutes * 60 * 1000;
+
+  const latestSnapshotMs = Number.isFinite(options?.latestSnapshotMs)
+    ? options.latestSnapshotMs
+    : getLatestIntervalTimestampMs(intervals);
+
+  if (!Number.isFinite(latestSnapshotMs)) {
+    return {
+      status: 'no-data',
+      isStale: true,
+      staleThresholdMinutes,
+      staleThresholdMs,
+      lastSnapshotAt: null,
+      lastSnapshotTimestampMs: null,
+      ageMs: null,
+      minutesStale: null
+    };
+  }
+
+  const ageMs = Math.max(0, Date.now() - latestSnapshotMs);
+  return {
+    status: ageMs > staleThresholdMs ? 'stale' : 'fresh',
+    isStale: ageMs > staleThresholdMs,
+    staleThresholdMinutes,
+    staleThresholdMs,
+    lastSnapshotAt: new Date(latestSnapshotMs).toISOString(),
+    lastSnapshotTimestampMs: latestSnapshotMs,
+    ageMs,
+    minutesStale: Math.floor(ageMs / (60 * 1000))
+  };
+};
+
+const recordTrafficCollectionSuccess = (timestampMs = Date.now()) => {
+  const safeTimestampMs = Number.isFinite(timestampMs) ? timestampMs : Date.now();
+  lastSuccessfulTrafficCollectionAtMs = safeTimestampMs;
+  consecutiveTrafficCollectionFailures = 0;
+  lastTrafficCollectionFailureAtMs = null;
+  lastTrafficCollectionFailureMessage = null;
+};
+
+const recordTrafficCollectionFailure = (reason = 'unknown') => {
+  consecutiveTrafficCollectionFailures += 1;
+  lastTrafficCollectionFailureAtMs = Date.now();
+  lastTrafficCollectionFailureMessage = String(reason || 'unknown');
+};
+
+const logTrafficCollectionWatchdog = () => {
+  const now = Date.now();
+  const fallbackLatestSnapshotMs = getLatestIntervalTimestampMs(trafficIntervals);
+  const referenceSuccessMs = Number.isFinite(lastSuccessfulTrafficCollectionAtMs)
+    ? lastSuccessfulTrafficCollectionAtMs
+    : fallbackLatestSnapshotMs;
+  const minutesSinceSuccess = Number.isFinite(referenceSuccessMs)
+    ? Math.floor(Math.max(0, now - referenceSuccessMs) / (60 * 1000))
+    : null;
+  const freshness = buildTrafficFreshness(trafficIntervals, {
+    latestSnapshotMs: referenceSuccessMs
+  });
+
+  const shouldAlert = (
+    !Number.isFinite(referenceSuccessMs) ||
+    (now - referenceSuccessMs) >= TRAFFIC_WATCHDOG_STALE_MS
+  );
+
+  if (shouldAlert) {
+    if ((now - lastTrafficWatchdogAlertAtMs) >= (55 * 1000)) {
+      const failureDetail = lastTrafficCollectionFailureMessage
+        ? ` lastFailure="${lastTrafficCollectionFailureMessage}"`
+        : '';
+      console.error(
+        `🚨 Watchdog alert: no successful traffic snapshot for ` +
+        `${minutesSinceSuccess !== null ? `${minutesSinceSuccess}m` : 'unknown duration'} ` +
+        `(threshold ${TRAFFIC_WATCHDOG_STALE_MINUTES}m, consecutiveFailures=${consecutiveTrafficCollectionFailures}).` +
+        failureDetail
+      );
+      lastTrafficWatchdogAlertAtMs = now;
+    }
+    return;
+  }
+
+  console.log(
+    `🔎 Watchdog OK: lastSnapshot=${freshness.lastSnapshotAt}, age=${freshness.minutesStale}m, ` +
+    `consecutiveFailures=${consecutiveTrafficCollectionFailures}`
+  );
+};
+
 const getLatestTimestampedInterval = (intervals) => {
   if (!Array.isArray(intervals) || intervals.length === 0) return null;
   for (let i = intervals.length - 1; i >= 0; i -= 1) {
@@ -2161,6 +2269,7 @@ const collectTrafficData = async () => {
 
     if (trafficData.length === 0) {
       console.warn('⚠️ No live traffic data returned; skipping interval capture.');
+      recordTrafficCollectionFailure('No live traffic data returned');
       return;
     }
     
@@ -2180,6 +2289,7 @@ const collectTrafficData = async () => {
       trafficIntervals = trafficIntervals.slice(-720);
     }
     invalidateTrafficTodayCache();
+    recordTrafficCollectionSuccess(parseIntervalTimestampMs(interval) || Date.now());
     
     // Save to database if available
     if (db) {
@@ -2214,11 +2324,16 @@ const collectTrafficData = async () => {
     
   } catch (error) {
     console.error('❌ Error collecting traffic data:', error.message);
+    recordTrafficCollectionFailure(error.message);
   }
 };
 
 // API endpoints
 app.get('/health', (req, res) => {
+  const freshness = buildTrafficFreshness(trafficIntervals);
+  const minutesSinceSuccessfulCollection = Number.isFinite(lastSuccessfulTrafficCollectionAtMs)
+    ? Math.floor(Math.max(0, Date.now() - lastSuccessfulTrafficCollectionAtMs) / (60 * 1000))
+    : null;
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -2230,7 +2345,20 @@ app.get('/health', (req, res) => {
     queuedTrafficHeavyReads: trafficHeavyReadQueue.length,
     trafficTodayCacheEntries: trafficTodayCache.size,
     trafficDayWindowCacheEntries: trafficDayWindowCache.size,
-    trafficStatsCacheEntries: trafficStatsCache.size
+    trafficStatsCacheEntries: trafficStatsCache.size,
+    freshness,
+    watchdog: {
+      staleThresholdMinutes: TRAFFIC_WATCHDOG_STALE_MINUTES,
+      lastSuccessfulCollectionAt: Number.isFinite(lastSuccessfulTrafficCollectionAtMs)
+        ? new Date(lastSuccessfulTrafficCollectionAtMs).toISOString()
+        : null,
+      minutesSinceSuccessfulCollection,
+      consecutiveFailures: consecutiveTrafficCollectionFailures,
+      lastFailureAt: Number.isFinite(lastTrafficCollectionFailureAtMs)
+        ? new Date(lastTrafficCollectionFailureAtMs).toISOString()
+        : null,
+      lastFailureMessage: lastTrafficCollectionFailureMessage
+    }
   });
 });
 
@@ -2320,6 +2448,7 @@ app.get('/api/traffic/window', async (req, res) => {
       }
 
       const segmentCount = Object.keys(dbData.segments || {}).length;
+      const windowFreshness = buildTrafficFreshness(dbData.intervals || []);
       const response = {
         intervals: dbData.intervals || [],
         segments: dbData.segments || {},
@@ -2342,7 +2471,8 @@ app.get('/api/traffic/window', async (req, res) => {
         radiusDays: dbData.radiusDays ?? radiusDays,
         startDayKey: dbData.startDayKey,
         endDayKeyExclusive: dbData.endDayKeyExclusive,
-        dbRecordCount: dbData.recordCount ?? (dbData.intervals || []).length
+        dbRecordCount: dbData.recordCount ?? (dbData.intervals || []).length,
+        freshness: windowFreshness
       };
       setTrafficDayWindowCachePayload(cacheKey, response);
       res.json(response);
@@ -2468,6 +2598,9 @@ app.get('/api/traffic/today', async (req, res) => {
               const mergedAgeMs = Number.isFinite(mergedLatestMs)
                 ? Math.max(0, Date.now() - mergedLatestMs)
                 : null;
+              const mergedFreshness = buildTrafficFreshness(mergedIntervals, {
+                latestSnapshotMs: mergedLatestMs
+              });
               const mergedSegments = {
                 ...(dbData.segments || {}),
                 ...(segmentData || {})
@@ -2497,13 +2630,17 @@ app.get('/api/traffic/today', async (req, res) => {
                 dbRecordCount: dbData.recordCount,
                 latestIntervalAgeMs: mergedAgeMs,
                 dbLatestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
-                memoryLatestIntervalAgeMs: memoryDataAgeMs
+                memoryLatestIntervalAgeMs: memoryDataAgeMs,
+                freshness: mergedFreshness
               };
               console.log(`✅ Served hybrid dataset: ${mergedIntervals.length} merged intervals (DB stale, memory tail appended)`);
               setTrafficTodayCachePayload(cacheKey, response);
               res.json(response);
               return;
             } else {
+              const dbFreshness = buildTrafficFreshness(dbData.intervals, {
+                latestSnapshotMs: latestDbIntervalMs
+              });
               response = {
                 intervals: dbData.intervals,
                 segments: dbData.segments,
@@ -2524,7 +2661,8 @@ app.get('/api/traffic/today', async (req, res) => {
                 serviceDays: requestedServiceDays,
                 dbRecordCount: dbData.recordCount,
                 latestIntervalAgeMs: Number.isFinite(dbDataAgeMs) ? dbDataAgeMs : null,
-                memoryLatestIntervalAgeMs: memoryDataAgeMs
+                memoryLatestIntervalAgeMs: memoryDataAgeMs,
+                freshness: dbFreshness
               };
               console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
               setTrafficTodayCachePayload(cacheKey, response);
@@ -2584,7 +2722,10 @@ app.get('/api/traffic/today', async (req, res) => {
         },
         fromDatabase: false,
         serviceDays: requestedServiceDays,
-        latestIntervalAgeMs: memoryDataAgeMs
+        latestIntervalAgeMs: memoryDataAgeMs,
+        freshness: buildTrafficFreshness(trafficIntervals, {
+          latestSnapshotMs: latestMemoryIntervalMs
+        })
       };
       
       setTrafficTodayCachePayload(cacheKey, response);
@@ -2988,6 +3129,10 @@ const startServer = async () => {
       `heapHard=${TRAFFIC_HEAP_HARD_REJECT_MB}MB, cacheToday=${TRAFFIC_TODAY_CACHE_MAX_KEYS}, ` +
       `cacheWindow=${TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS}`
     );
+    console.log(
+      `🛰️ Freshness guard: staleThreshold=${TRAFFIC_STALE_THRESHOLD_MINUTES}m, ` +
+      `watchdogAlertThreshold=${TRAFFIC_WATCHDOG_STALE_MINUTES}m`
+    );
   });
 
   httpServer.on('error', (error) => {
@@ -3012,6 +3157,10 @@ const startServer = async () => {
       `heapTotal=${toMb(usage.heapTotal)}MB ext=${toMb(usage.external)}MB`
     );
   }, 5 * 60 * 1000);
+
+  // Minute-level self-check: logs health and emits alert when snapshot freshness is too old.
+  logTrafficCollectionWatchdog();
+  setInterval(logTrafficCollectionWatchdog, TRAFFIC_WATCHDOG_INTERVAL_MS);
 
   // Prime counter-flow state from latest persisted snapshot when available.
   bootstrapCounterFlowFromDatabase()
