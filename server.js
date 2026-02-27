@@ -9,6 +9,11 @@ const TrafficDatabase = require('./database');
 const app = express();
 const PORT = process.env.PORT || 3002;
 
+// Keep process alive while logging background async failures for Railway crash triage.
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Unhandled promise rejection:', reason);
+});
+
 // Enable CORS for external frontend
 app.use(cors({
   origin: '*',
@@ -499,7 +504,14 @@ const scheduleNextTrafficCollection = (delayMs = null) => {
   const effectiveDelayMs = Number.isFinite(delayMs) && delayMs >= 0
     ? delayMs
     : cadence.intervalMs;
-  trafficCollectionTimer = setTimeout(runTrafficCollectionCycle, effectiveDelayMs);
+  trafficCollectionTimer = setTimeout(() => {
+    runTrafficCollectionCycle().catch((error) => {
+      console.error('❌ Traffic collection cycle crashed:', error);
+      if (isCollecting) {
+        scheduleNextTrafficCollection(15 * 1000);
+      }
+    });
+  }, effectiveDelayMs);
 };
 
 const runTrafficCollectionCycle = async () => {
@@ -511,8 +523,14 @@ const runTrafficCollectionCycle = async () => {
   }
 
   const cycleStartedAt = Date.now();
-  const startCadence = getTrafficCollectionCadence(new Date(cycleStartedAt));
-  if (startCadence.label !== lastTrafficCollectionCadenceLabel) {
+  let startCadence = null;
+  try {
+    startCadence = getTrafficCollectionCadence(new Date(cycleStartedAt));
+  } catch (error) {
+    console.error('❌ Failed to resolve traffic collection cadence:', error);
+  }
+
+  if (startCadence && startCadence.label !== lastTrafficCollectionCadenceLabel) {
     console.log(
       `⏱️ Traffic collection cadence: ${startCadence.label} ` +
       `(hour ${startCadence.localHour}, tz=${TRAFFIC_COLLECTION_TIME_ZONE}, ` +
@@ -524,12 +542,21 @@ const runTrafficCollectionCycle = async () => {
   trafficCollectionInFlight = true;
   try {
     await collectTrafficData();
+  } catch (error) {
+    console.error('❌ Traffic collection cycle failed:', error);
   } finally {
     trafficCollectionInFlight = false;
-    const nextCadence = getTrafficCollectionCadence(new Date());
-    const elapsedMs = Date.now() - cycleStartedAt;
-    const nextDelayMs = Math.max(1000, nextCadence.intervalMs - elapsedMs);
-    scheduleNextTrafficCollection(nextDelayMs);
+    if (isCollecting) {
+      try {
+        const nextCadence = getTrafficCollectionCadence(new Date());
+        const elapsedMs = Date.now() - cycleStartedAt;
+        const nextDelayMs = Math.max(1000, nextCadence.intervalMs - elapsedMs);
+        scheduleNextTrafficCollection(nextDelayMs);
+      } catch (error) {
+        console.error('❌ Failed to schedule next traffic collection cycle:', error);
+        scheduleNextTrafficCollection(15 * 1000);
+      }
+    }
   }
 };
 
@@ -2950,29 +2977,8 @@ const startServer = async () => {
     `window=${TRAFFIC_COLLECTION_OFFPEAK_START_HOUR}:00-${TRAFFIC_COLLECTION_OFFPEAK_END_HOUR}:00 ` +
     `${TRAFFIC_COLLECTION_TIME_ZONE}`
   );
-  
-  // Start data collection
-  isCollecting = true;
-  await runTrafficCollectionCycle();
 
-  // Lightweight memory heartbeat for crash triage on Railway.
-  setInterval(() => {
-    const usage = process.memoryUsage();
-    const toMb = (bytes) => Math.round((bytes / (1024 * 1024)) * 10) / 10;
-    console.log(
-      `🧠 Memory rss=${toMb(usage.rss)}MB heapUsed=${toMb(usage.heapUsed)}MB ` +
-      `heapTotal=${toMb(usage.heapTotal)}MB ext=${toMb(usage.external)}MB`
-    );
-  }, 5 * 60 * 1000);
-  
-  // Prime counter-flow state from latest persisted snapshot when available.
-  await bootstrapCounterFlowFromDatabase();
-
-  // Collect counter-flow data every 60 seconds
-  await updateCounterFlowData(); // Initial collection
-  setInterval(updateCounterFlowData, 60 * 1000);
-  
-  app.listen(PORT, () => {
+  const httpServer = app.listen(PORT, () => {
     console.log(`🌐 Server running on port ${PORT}`);
     console.log(`📍 Monitoring ${NORTH_VAN_ROADS.length} major roads with ${Object.keys(segmentData).length} segments`);
     console.log(`🔑 HERE API: ${HERE_API_KEY !== 'YOUR_HERE_API_KEY_NEEDED' ? 'Configured' : 'Not configured'}`);
@@ -2983,6 +2989,47 @@ const startServer = async () => {
       `cacheWindow=${TRAFFIC_DAY_WINDOW_CACHE_MAX_KEYS}`
     );
   });
+
+  httpServer.on('error', (error) => {
+    console.error('❌ HTTP server error:', error);
+  });
+
+  // Start background collectors after server is listening so Railway can pass health checks quickly.
+  isCollecting = true;
+  runTrafficCollectionCycle().catch((error) => {
+    console.error('❌ Initial traffic collection failed:', error);
+    if (isCollecting) {
+      scheduleNextTrafficCollection(15 * 1000);
+    }
+  });
+
+  // Lightweight memory heartbeat for crash triage on Railway.
+  setInterval(() => {
+    const usage = process.memoryUsage();
+    const toMb = (bytes) => Math.round((bytes / (1024 * 1024)) * 10) / 10;
+    console.log(
+      `🧠 Memory rss=${toMb(usage.rss)}MB heapUsed=${toMb(usage.heapUsed)}MB ` +
+      `heapTotal=${toMb(usage.heapTotal)}MB ext=${toMb(usage.external)}MB`
+    );
+  }, 5 * 60 * 1000);
+
+  // Prime counter-flow state from latest persisted snapshot when available.
+  bootstrapCounterFlowFromDatabase()
+    .catch((error) => {
+      console.warn(`⚠️ Counter-flow DB bootstrap failed: ${error.message}`);
+    })
+    .finally(() => {
+      updateCounterFlowData().catch((error) => {
+        console.warn(`⚠️ Initial counter-flow update failed: ${error.message}`);
+      });
+    });
+
+  // Collect counter-flow data every 60 seconds.
+  setInterval(() => {
+    updateCounterFlowData().catch((error) => {
+      console.warn(`⚠️ Counter-flow update failed: ${error.message}`);
+    });
+  }, 60 * 1000);
 };
 
 startServer().catch(console.error);
