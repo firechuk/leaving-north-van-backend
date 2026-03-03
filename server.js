@@ -156,6 +156,7 @@ const TRAFFIC_STATS_MAX_LOOKBACK_WEEKS = 20;
 const TRAFFIC_STATS_DEFAULT_LOOKBACK_WEEKS = 8;
 const TRAFFIC_STATS_DEFAULT_MAX_SAME_WEEKDAY_SAMPLES = 8;
 const TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES = 2;
+const TRAFFIC_SERVICE_DAY_SLOTS = Math.floor((24 * 60) / TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES);
 const TRAFFIC_STATS_WINDOW_MINUTES = 30;
 const TRAFFIC_STATS_STATUS_THRESHOLDS = {
   freeFlow: 0.55,
@@ -910,6 +911,108 @@ const getTrafficServiceDayKey = (date = new Date()) => {
 const getTrafficServiceDayKeyFromTimestampMs = (timestampMs) => {
   if (!Number.isFinite(timestampMs)) return null;
   return getTrafficServiceDayKey(new Date(timestampMs));
+};
+
+const getTrafficLocalHourMinute = (date = new Date()) => {
+  const parts = trafficCollectionMinuteFormatter.formatToParts(date);
+  const values = {};
+  parts.forEach((part) => {
+    if (part.type !== 'literal') values[part.type] = part.value;
+  });
+  const hour = Number.parseInt(values.hour, 10);
+  const minute = Number.parseInt(values.minute, 10);
+  return {
+    hour: Number.isFinite(hour) ? Math.max(0, Math.min(23, hour)) : 0,
+    minute: Number.isFinite(minute) ? Math.max(0, Math.min(59, minute)) : 0
+  };
+};
+
+const clampTrafficServiceSlot = (slot) => {
+  if (!Number.isFinite(slot)) return null;
+  return Math.max(0, Math.min(TRAFFIC_SERVICE_DAY_SLOTS - 1, Math.floor(slot)));
+};
+
+const getTrafficServiceSlotFromTimestampMs = (timestampMs) => {
+  if (!Number.isFinite(timestampMs)) return null;
+  const { hour, minute } = getTrafficLocalHourMinute(new Date(timestampMs));
+  const totalMinutes = (hour * 60) + minute;
+  const rawSlot = Math.floor(totalMinutes / TRAFFIC_STATS_SNAPSHOT_STEP_MINUTES);
+  return clampTrafficServiceSlot(rawSlot);
+};
+
+const getIntervalSegmentIds = (interval = {}) => (
+  Object.keys(interval || {}).filter((key) => key !== 'timestamp')
+);
+
+const pickSegmentMetadataForInterval = (segments = {}, interval = null) => {
+  const segmentIds = getIntervalSegmentIds(interval);
+  if (segmentIds.length === 0) {
+    return { subset: { ...(segments || {}) }, segmentIds: [] };
+  }
+
+  const subset = {};
+  segmentIds.forEach((segmentId) => {
+    if (!segments || !segments[segmentId]) return;
+    subset[segmentId] = segments[segmentId];
+  });
+
+  if (Object.keys(subset).length === 0) {
+    return { subset: { ...(segments || {}) }, segmentIds };
+  }
+
+  return { subset, segmentIds };
+};
+
+const selectFocusIntervalForDay = (intervals = [], requestedSlot = null) => {
+  const valid = (Array.isArray(intervals) ? intervals : [])
+    .map((interval) => {
+      const timestampMs = parseIntervalTimestampMs(interval);
+      if (!Number.isFinite(timestampMs)) return null;
+      const slot = getTrafficServiceSlotFromTimestampMs(timestampMs);
+      if (!Number.isFinite(slot)) return null;
+      return { interval, timestampMs, slot };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+
+  if (valid.length === 0) {
+    return {
+      entry: null,
+      requestedSlot: clampTrafficServiceSlot(requestedSlot),
+      hasExactSlotMatch: false
+    };
+  }
+
+  const normalizedRequestedSlot = clampTrafficServiceSlot(requestedSlot);
+  if (!Number.isFinite(normalizedRequestedSlot)) {
+    return {
+      entry: valid[valid.length - 1],
+      requestedSlot: null,
+      hasExactSlotMatch: false
+    };
+  }
+
+  let selected = valid[0];
+  let selectedDistance = Math.abs(valid[0].slot - normalizedRequestedSlot);
+  for (let i = 1; i < valid.length; i += 1) {
+    const candidate = valid[i];
+    const candidateDistance = Math.abs(candidate.slot - normalizedRequestedSlot);
+    if (candidateDistance < selectedDistance) {
+      selected = candidate;
+      selectedDistance = candidateDistance;
+      continue;
+    }
+    if (candidateDistance === selectedDistance && candidate.timestampMs > selected.timestampMs) {
+      selected = candidate;
+      selectedDistance = candidateDistance;
+    }
+  }
+
+  return {
+    entry: selected,
+    requestedSlot: normalizedRequestedSlot,
+    hasExactSlotMatch: selected.slot === normalizedRequestedSlot
+  };
 };
 
 const getDayOfWeekFromTrafficDayKey = (dayKey) => {
@@ -2360,6 +2463,143 @@ app.get('/health', (req, res) => {
       lastFailureMessage: lastTrafficCollectionFailureMessage
     }
   });
+});
+
+app.get('/api/traffic/focus', async (req, res) => {
+  try {
+    const requestedDayRaw = String(
+      req.query.day || req.query.date || getTrafficServiceDayKey(new Date())
+    ).trim();
+    if (!parseTrafficDayKey(requestedDayRaw)) {
+      res.status(400).json({
+        error: 'Missing or invalid day. Expected YYYY-MM-DD.'
+      });
+      return;
+    }
+
+    const requestedSlotRaw = Number.parseInt(req.query.slot, 10);
+    const requestedSlot = clampTrafficServiceSlot(requestedSlotRaw);
+    const currentServiceDayKey = getTrafficServiceDayKey(new Date());
+
+    const memoryDayIntervals = filterIntervalsByDayKey(trafficIntervals, requestedDayRaw);
+    const memorySegments = segmentData && typeof segmentData === 'object'
+      ? segmentData
+      : {};
+    let mergedIntervals = memoryDayIntervals;
+    let mergedSegments = { ...memorySegments };
+    let fromMemory = memoryDayIntervals.length > 0;
+    let fromDatabase = false;
+    let dataSource = fromMemory ? 'memory-focus' : 'no-focus-data';
+    let dbData = null;
+
+    const shouldQueryDb = !!db && (
+      requestedDayRaw !== currentServiceDayKey ||
+      memoryDayIntervals.length === 0 ||
+      Object.keys(mergedSegments).length === 0
+    );
+
+    if (shouldQueryDb) {
+      try {
+        dbData = await runTrafficHeavyRead(
+          '/api/traffic/focus',
+          () => db.getTrafficDataForDayWindow(requestedDayRaw, 0)
+        );
+      } catch (dbError) {
+        const canFallbackToMemory = fromMemory && requestedDayRaw === currentServiceDayKey;
+        if (!canFallbackToMemory) {
+          throw dbError;
+        }
+        console.warn(
+          `⚠️ /api/traffic/focus DB read failed (${dbError.code || 'error'}: ${dbError.message}); ` +
+          'serving memory-only focus snapshot.'
+        );
+      }
+    }
+
+    if (dbData) {
+      const dbIntervals = filterIntervalsByDayKey(dbData.intervals || [], requestedDayRaw);
+      const dbSegments = dbData.segments && typeof dbData.segments === 'object'
+        ? dbData.segments
+        : {};
+      mergedIntervals = mergeIntervalsByTimestamp(dbIntervals, memoryDayIntervals);
+      mergedSegments = {
+        ...dbSegments,
+        ...mergedSegments
+      };
+      if (dbIntervals.length > 0) {
+        fromDatabase = true;
+      }
+      if (fromDatabase && fromMemory) {
+        dataSource = 'hybrid-focus';
+      } else if (fromDatabase) {
+        dataSource = 'database-focus';
+      }
+    }
+
+    const focusSelection = selectFocusIntervalForDay(mergedIntervals, requestedSlot);
+    const selectedEntry = focusSelection.entry;
+    const selectedInterval = selectedEntry?.interval || null;
+    const selectedTimestampMs = selectedEntry?.timestampMs;
+    const selectedSlot = Number.isFinite(selectedEntry?.slot) ? selectedEntry.slot : null;
+    const selectedTimestampIso = Number.isFinite(selectedTimestampMs)
+      ? new Date(selectedTimestampMs).toISOString()
+      : null;
+    const focusIntervalList = selectedInterval ? [selectedInterval] : [];
+    const intervalSegments = pickSegmentMetadataForInterval(mergedSegments, selectedInterval);
+    const focusFreshness = buildTrafficFreshness(
+      focusIntervalList,
+      Number.isFinite(selectedTimestampMs) ? { latestSnapshotMs: selectedTimestampMs } : {}
+    );
+
+    const response = {
+      intervals: focusIntervalList,
+      segments: intervalSegments.subset,
+      totalSegments: Object.keys(intervalSegments.subset).length,
+      currentIntervalIndex: focusIntervalList.length > 0 ? 0 : -1,
+      maxInterval: focusIntervalList.length > 0 ? 0 : -1,
+      coverage: `North Vancouver focus interval: ${Object.keys(intervalSegments.subset).length} segments across ${NORTH_VAN_ROADS.length} major roads`,
+      dataSource,
+      counterFlow: {
+        status: counterFlowData.currentStatus ?? dbData?.counterFlow?.currentStatus ?? null,
+        lanesOutbound: counterFlowData.lanesOutbound || dbData?.counterFlow?.lanesOutbound || 1,
+        statusSince: counterFlowData.statusSince || dbData?.counterFlow?.statusSince || null,
+        lastChecked: counterFlowData.lastChecked || dbData?.counterFlow?.lastChecked || null,
+        durationMs: (counterFlowData.statusSince || dbData?.counterFlow?.statusSince)
+          ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
+          : null
+      },
+      fromDatabase,
+      fromMemory,
+      serviceDays: 1,
+      focusDayKey: requestedDayRaw,
+      focusRequestedSlot: focusSelection.requestedSlot,
+      focusResolvedSlot: selectedSlot,
+      focusHasExactSlotMatch: focusSelection.hasExactSlotMatch,
+      focusTimestamp: selectedTimestampIso,
+      focusSegmentIds: intervalSegments.segmentIds,
+      latestIntervalAgeMs: Number.isFinite(selectedTimestampMs)
+        ? Math.max(0, Date.now() - selectedTimestampMs)
+        : null,
+      freshness: focusFreshness
+    };
+
+    res.json(response);
+  } catch (error) {
+    if (error?.code === 'MEMORY_PRESSURE_HARD_REJECT' || error?.code === 'HEAVY_READ_QUEUE_TIMEOUT') {
+      console.warn(`⚠️ /api/traffic/focus degraded response: ${error.code} (${error.message})`);
+      res.set('Retry-After', '5');
+      res.status(503).json({
+        error: 'Traffic focus snapshot temporarily unavailable; please retry in a few seconds.',
+        code: error.code
+      });
+      return;
+    }
+    console.error('❌ Error in /api/traffic/focus:', error);
+    res.status(500).json({
+      error: 'Failed to fetch traffic focus snapshot',
+      details: error.message
+    });
+  }
 });
 
 app.get('/api/traffic/window', async (req, res) => {

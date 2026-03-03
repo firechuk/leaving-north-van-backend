@@ -18,11 +18,13 @@ Canonical project handoff doc:
 - Snapshot cadence: every 2 minutes
 - Service day boundary: midnight Vancouver time (`0:00`)
 - Per-snapshot data includes tracked segments + counterflow state
+- `/api/traffic/focus` provides a single-interval bootstrap payload for fast initial render
 - `/api/traffic/today` supports variable history window via `serviceDays`
 
 ## API Endpoints
 
 - `GET /health`
+- `GET /api/traffic/focus?day=YYYY-MM-DD&slot=NNN`
 - `GET /api/traffic/today?serviceDays=N&refresh=1`
 - `GET /api/database/stats`
 - `GET /api/debug/routes`
