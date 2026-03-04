@@ -1645,12 +1645,12 @@ const mergeIntervalsByTimestamp = (primaryIntervals, secondaryIntervals) => {
     mergedByTimestamp.set(dedupeKey, interval);
   };
 
-  // Primary first, then secondary overrides overlapping timestamps.
-  if (Array.isArray(primaryIntervals)) {
-    primaryIntervals.forEach(pushInterval);
-  }
+  // Secondary first, then primary wins on overlapping timestamps.
   if (Array.isArray(secondaryIntervals)) {
     secondaryIntervals.forEach(pushInterval);
+  }
+  if (Array.isArray(primaryIntervals)) {
+    primaryIntervals.forEach(pushInterval);
   }
 
   return Array.from(mergedByTimestamp.entries())
@@ -2394,10 +2394,10 @@ const collectTrafficData = async () => {
       ? fetchResult.segmentMetadata
       : {};
     
-    // Replace segment data entirely with new HERE metadata
+    // Merge new HERE segment metadata into accumulated segment data
     if (segmentMetadata && Object.keys(segmentMetadata).length > 0) {
-      segmentData = segmentMetadata; // REPLACE, don't merge
-      console.log(`📍 Replaced segment data with ${Object.keys(segmentMetadata).length} HERE segments`);
+      segmentData = { ...segmentData, ...segmentMetadata };
+      console.log(`📍 Merged segment data: ${Object.keys(segmentData).length} total segments (${Object.keys(segmentMetadata).length} from this cycle)`);
     }
 
     updateDebugRouteSnapshotFromFetch(fetchResult, timestamp);
@@ -2613,11 +2613,11 @@ app.get('/api/traffic/focus', async (req, res) => {
       dataSource,
       counterFlow: {
         status: counterFlowData.currentStatus ?? dbData?.counterFlow?.currentStatus ?? null,
-        lanesOutbound: counterFlowData.lanesOutbound || dbData?.counterFlow?.lanesOutbound || 1,
-        statusSince: counterFlowData.statusSince || dbData?.counterFlow?.statusSince || null,
-        lastChecked: counterFlowData.lastChecked || dbData?.counterFlow?.lastChecked || null,
-        durationMs: (counterFlowData.statusSince || dbData?.counterFlow?.statusSince)
-          ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
+        lanesOutbound: counterFlowData.lanesOutbound ?? dbData?.counterFlow?.lanesOutbound ?? 1,
+        statusSince: counterFlowData.statusSince ?? dbData?.counterFlow?.statusSince ?? null,
+        lastChecked: counterFlowData.lastChecked ?? dbData?.counterFlow?.lastChecked ?? null,
+        durationMs: (counterFlowData.statusSince ?? dbData?.counterFlow?.statusSince)
+          ? Date.now() - new Date(counterFlowData.statusSince ?? dbData.counterFlow.statusSince).getTime()
           : null
       },
       fromDatabase,
@@ -2751,11 +2751,11 @@ app.get('/api/traffic/window', async (req, res) => {
         dataSource: 'database-window',
         counterFlow: {
           status: counterFlowData.currentStatus ?? dbData.counterFlow?.currentStatus,
-          lanesOutbound: counterFlowData.lanesOutbound || dbData.counterFlow?.lanesOutbound || 1,
-          statusSince: counterFlowData.statusSince || dbData.counterFlow?.statusSince,
-          lastChecked: counterFlowData.lastChecked || dbData.counterFlow?.lastChecked,
-          durationMs: (counterFlowData.statusSince || dbData.counterFlow?.statusSince)
-            ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
+          lanesOutbound: counterFlowData.lanesOutbound ?? dbData.counterFlow?.lanesOutbound ?? 1,
+          statusSince: counterFlowData.statusSince ?? dbData.counterFlow?.statusSince,
+          lastChecked: counterFlowData.lastChecked ?? dbData.counterFlow?.lastChecked,
+          durationMs: (counterFlowData.statusSince ?? dbData.counterFlow?.statusSince)
+            ? Date.now() - new Date(counterFlowData.statusSince ?? dbData.counterFlow.statusSince).getTime()
             : null
         },
         fromDatabase: true,
@@ -2908,11 +2908,11 @@ app.get('/api/traffic/today', async (req, res) => {
                 dataSource: canMergeDbAndMemory ? 'hybrid-db-memory' : 'hybrid-db-memory-incompatible',
                 counterFlow: {
                   status: counterFlowData.currentStatus ?? dbData.counterFlow?.currentStatus,
-                  lanesOutbound: counterFlowData.lanesOutbound || dbData.counterFlow?.lanesOutbound || 1,
-                  statusSince: counterFlowData.statusSince || dbData.counterFlow?.statusSince,
-                  lastChecked: counterFlowData.lastChecked || dbData.counterFlow?.lastChecked,
-                  durationMs: (counterFlowData.statusSince || dbData.counterFlow?.statusSince)
-                    ? Date.now() - new Date(counterFlowData.statusSince || dbData.counterFlow.statusSince).getTime()
+                  lanesOutbound: counterFlowData.lanesOutbound ?? dbData.counterFlow?.lanesOutbound ?? 1,
+                  statusSince: counterFlowData.statusSince ?? dbData.counterFlow?.statusSince,
+                  lastChecked: counterFlowData.lastChecked ?? dbData.counterFlow?.lastChecked,
+                  durationMs: (counterFlowData.statusSince ?? dbData.counterFlow?.statusSince)
+                    ? Date.now() - new Date(counterFlowData.statusSince ?? dbData.counterFlow.statusSince).getTime()
                     : null
                 },
                 fromDatabase: true,
@@ -2943,7 +2943,7 @@ app.get('/api/traffic/today', async (req, res) => {
                 dataSource: 'database-persistent',
                 counterFlow: {
                   status: dbData.counterFlow.currentStatus,
-                  lanesOutbound: dbData.counterFlow.lanesOutbound || 1,
+                  lanesOutbound: dbData.counterFlow.lanesOutbound ?? 1,
                   statusSince: dbData.counterFlow.statusSince,
                   lastChecked: dbData.counterFlow.lastChecked,
                   durationMs: dbData.counterFlow.statusSince ? 
@@ -3006,7 +3006,7 @@ app.get('/api/traffic/today', async (req, res) => {
         dataSource: trafficIntervals.length > 0 ? 'memory-ephemeral' : 'no-live-data',
         counterFlow: {
           status: counterFlowData.currentStatus,
-          lanesOutbound: counterFlowData.lanesOutbound || 1,
+          lanesOutbound: counterFlowData.lanesOutbound ?? 1,
           statusSince: counterFlowData.statusSince,
           lastChecked: counterFlowData.lastChecked,
           durationMs: counterFlowData.statusSince ? 
@@ -3020,6 +3020,11 @@ app.get('/api/traffic/today', async (req, res) => {
         })
       };
       
+      // Signal to frontend if service days were capped
+      response.requestedServiceDays = requestedServiceDaysRaw;
+      response.grantedServiceDays = requestedServiceDays;
+      response.serviceDaysCapped = requestedServiceDays !== requestedServiceDaysRaw;
+
       setTrafficTodayCachePayload(cacheKey, response);
       res.json(response);
     } finally {
