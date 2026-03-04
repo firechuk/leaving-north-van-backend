@@ -2885,7 +2885,8 @@ app.get('/api/traffic/today', async (req, res) => {
               if (!canMergeDbAndMemory) {
                 console.warn('⚠️ DB and memory interval schemas appear different; merging by timestamp with unioned segment metadata.');
               }
-              const mergedIntervals = mergeIntervalsByTimestamp(dbData.intervals, trafficIntervals);
+              // Memory (trafficIntervals) is primary: stale DB yields to fresher in-memory data on overlapping timestamps.
+              const mergedIntervals = mergeIntervalsByTimestamp(trafficIntervals, dbData.intervals);
               const mergedLatestMs = getLatestIntervalTimestampMs(mergedIntervals);
               const mergedAgeMs = Number.isFinite(mergedLatestMs)
                 ? Math.max(0, Date.now() - mergedLatestMs)
@@ -2926,6 +2927,9 @@ app.get('/api/traffic/today', async (req, res) => {
                 freshness: mergedFreshness
               };
               console.log(`✅ Served hybrid dataset: ${mergedIntervals.length} merged intervals (DB stale, memory tail appended)`);
+              response.requestedServiceDays = requestedServiceDaysRaw;
+              response.grantedServiceDays = requestedServiceDays;
+              response.serviceDaysCapped = requestedServiceDays !== requestedServiceDaysRaw;
               setTrafficTodayCachePayload(cacheKey, response);
               res.json(response);
               return;
@@ -2957,6 +2961,9 @@ app.get('/api/traffic/today', async (req, res) => {
                 freshness: dbFreshness
               };
               console.log(`✅ Successfully served ${dbData.intervals.length} intervals from database (expanded coverage)`);
+              response.requestedServiceDays = requestedServiceDaysRaw;
+              response.grantedServiceDays = requestedServiceDays;
+              response.serviceDaysCapped = requestedServiceDays !== requestedServiceDaysRaw;
               setTrafficTodayCachePayload(cacheKey, response);
               res.json(response);
               return;
