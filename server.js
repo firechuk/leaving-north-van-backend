@@ -963,6 +963,38 @@ const pickSegmentMetadataForInterval = (segments = {}, interval = null) => {
   return { subset, segmentIds };
 };
 
+const chooseBestDrawableFocusEntry = (entries = [], segments = {}) => {
+  const validEntries = Array.isArray(entries) ? entries : [];
+  if (validEntries.length === 0) return null;
+  const segmentKeys = new Set(Object.keys(segments || {}));
+
+  let best = null;
+  validEntries.forEach((entry) => {
+    if (!entry || !entry.interval) return;
+    const segmentIds = getIntervalSegmentIds(entry.interval);
+    let overlapCount = 0;
+    segmentIds.forEach((segmentId) => {
+      if (segmentKeys.has(segmentId)) {
+        overlapCount += 1;
+      }
+    });
+
+    if (!best) {
+      best = { entry, overlapCount };
+      return;
+    }
+    if (overlapCount > best.overlapCount) {
+      best = { entry, overlapCount };
+      return;
+    }
+    if (overlapCount === best.overlapCount && entry.timestampMs > best.entry.timestampMs) {
+      best = { entry, overlapCount };
+    }
+  });
+
+  return best ? best.entry : null;
+};
+
 const selectFocusIntervalForDay = (intervals = [], requestedSlot = null) => {
   const valid = (Array.isArray(intervals) ? intervals : [])
     .map((interval) => {
@@ -2537,7 +2569,27 @@ app.get('/api/traffic/focus', async (req, res) => {
     }
 
     const focusSelection = selectFocusIntervalForDay(mergedIntervals, requestedSlot);
-    const selectedEntry = focusSelection.entry;
+    let selectedEntry = focusSelection.entry;
+    if (selectedEntry) {
+      const firstPickSegments = pickSegmentMetadataForInterval(mergedSegments, selectedEntry.interval);
+      if (Object.keys(firstPickSegments.subset).length === 0) {
+        const fallbackEntry = chooseBestDrawableFocusEntry(
+          (Array.isArray(mergedIntervals) ? mergedIntervals : [])
+            .map((interval) => {
+              const timestampMs = parseIntervalTimestampMs(interval);
+              const slot = getTrafficServiceSlotFromTimestampMs(timestampMs);
+              if (!Number.isFinite(timestampMs) || !Number.isFinite(slot)) return null;
+              return { interval, timestampMs, slot };
+            })
+            .filter(Boolean),
+          mergedSegments
+        );
+        if (fallbackEntry) {
+          selectedEntry = fallbackEntry;
+        }
+      }
+    }
+
     const selectedInterval = selectedEntry?.interval || null;
     const selectedTimestampMs = selectedEntry?.timestampMs;
     const selectedSlot = Number.isFinite(selectedEntry?.slot) ? selectedEntry.slot : null;
