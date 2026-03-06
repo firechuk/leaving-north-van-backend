@@ -8,6 +8,25 @@ const TrafficDatabase = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
+const GA_PROPERTY_ID = String(process.env.GA_PROPERTY_ID || '').trim();
+const GA_SERVICE_ACCOUNT_EMAIL = String(process.env.GA_SERVICE_ACCOUNT_EMAIL || '').trim();
+const GA_SERVICE_ACCOUNT_PRIVATE_KEY = process.env.GA_SERVICE_ACCOUNT_PRIVATE_KEY
+  ? String(process.env.GA_SERVICE_ACCOUNT_PRIVATE_KEY).replace(/\\n/g, '\n')
+  : '';
+const GA_READONLY_SCOPE = 'https://www.googleapis.com/auth/analytics.readonly';
+const GOOGLE_TOKEN_AUDIENCE = 'https://oauth2.googleapis.com/token';
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GA_REPORTING_BASE_URL = 'https://analyticsdata.googleapis.com/v1beta';
+const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
+const googleAccessTokenCache = {
+  accessToken: null,
+  expiresAt: 0
+};
+const dashboardOverviewCache = {
+  payload: null,
+  fetchedAt: 0,
+  promise: null
+};
 
 // Keep process alive while logging background async failures for Railway crash triage.
 process.on('unhandledRejection', (reason) => {
@@ -278,6 +297,295 @@ let activeTrafficHeavyReads = 0;
 const trafficHeavyReadQueue = [];
 let lastSuccessfulTrafficCollectionAtMs = null;
 let lastTrafficCollectionFailureAtMs = null;
+
+function isGoogleAnalyticsConfigured() {
+  return Boolean(GA_PROPERTY_ID && GA_SERVICE_ACCOUNT_EMAIL && GA_SERVICE_ACCOUNT_PRIVATE_KEY);
+}
+
+function base64UrlEncode(value) {
+  const source = typeof value === 'string' ? value : JSON.stringify(value);
+  return Buffer.from(source)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+async function getGoogleAnalyticsAccessToken() {
+  const nowMs = Date.now();
+  if (googleAccessTokenCache.accessToken && googleAccessTokenCache.expiresAt > nowMs + 60 * 1000) {
+    return googleAccessTokenCache.accessToken;
+  }
+
+  if (!isGoogleAnalyticsConfigured()) {
+    throw new Error('Google Analytics dashboard credentials are not configured.');
+  }
+
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const jwtHeader = { alg: 'RS256', typ: 'JWT' };
+  const jwtClaimSet = {
+    iss: GA_SERVICE_ACCOUNT_EMAIL,
+    scope: GA_READONLY_SCOPE,
+    aud: GOOGLE_TOKEN_AUDIENCE,
+    exp: nowSeconds + 3600,
+    iat: nowSeconds
+  };
+
+  const unsignedToken = `${base64UrlEncode(jwtHeader)}.${base64UrlEncode(jwtClaimSet)}`;
+  const signature = crypto
+    .createSign('RSA-SHA256')
+    .update(unsignedToken)
+    .sign(GA_SERVICE_ACCOUNT_PRIVATE_KEY, 'base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+
+  const assertion = `${unsignedToken}.${signature}`;
+  const body = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion
+  });
+
+  const response = await axios.post(GOOGLE_TOKEN_URL, body.toString(), {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    timeout: 15000
+  });
+
+  const accessToken = response?.data?.access_token;
+  const expiresIn = Number(response?.data?.expires_in) || 3600;
+  if (!accessToken) {
+    throw new Error('Google access token response did not include an access token.');
+  }
+
+  googleAccessTokenCache.accessToken = accessToken;
+  googleAccessTokenCache.expiresAt = nowMs + (expiresIn * 1000);
+  return accessToken;
+}
+
+async function runGoogleAnalyticsReport(reportType, body) {
+  if (!isGoogleAnalyticsConfigured()) {
+    return null;
+  }
+
+  const accessToken = await getGoogleAnalyticsAccessToken();
+  const endpoint = `${GA_REPORTING_BASE_URL}/properties/${GA_PROPERTY_ID}:${reportType}`;
+  const response = await axios.post(endpoint, body, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 20000
+  });
+  return response.data;
+}
+
+function readMetricValue(row, index = 0) {
+  const value = row?.metricValues?.[index]?.value;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function readDimensionValue(row, index = 0) {
+  return String(row?.dimensionValues?.[index]?.value || '').trim();
+}
+
+async function buildGoogleAnalyticsSnapshot() {
+  const trackedEvents = ['view_change', 'day_select', 'day_load_result', 'play_toggle', 'scrub_use', 'share_click'];
+  if (!isGoogleAnalyticsConfigured()) {
+    return {
+      configured: false,
+      available: false,
+      propertyId: null,
+      eventsTracked: trackedEvents
+    };
+  }
+
+  try {
+    const [
+      realtimeReport,
+      summaryReport,
+      trendReport,
+      channelReport,
+      deviceReport,
+      eventReport
+    ] = await Promise.all([
+      runGoogleAnalyticsReport('runRealtimeReport', {
+        metrics: [{ name: 'activeUsers' }]
+      }),
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }],
+        metrics: [
+          { name: 'totalUsers' },
+          { name: 'sessions' },
+          { name: 'screenPageViews' }
+        ]
+      }),
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dimensions: [{ name: 'date' }],
+        metrics: [
+          { name: 'totalUsers' },
+          { name: 'sessions' },
+          { name: 'screenPageViews' }
+        ],
+        orderBys: [{ dimension: { dimensionName: 'date' } }]
+      }),
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dimensions: [{ name: 'sessionPrimaryChannelGroup' }],
+        metrics: [
+          { name: 'sessions' },
+          { name: 'totalUsers' }
+        ],
+        orderBys: [{ metric: { metricName: 'sessions' }, desc: true }],
+        limit: 6
+      }),
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dimensions: [{ name: 'deviceCategory' }],
+        metrics: [{ name: 'activeUsers' }],
+        orderBys: [{ metric: { metricName: 'activeUsers' }, desc: true }],
+        limit: 5
+      }),
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dimensions: [{ name: 'eventName' }],
+        metrics: [{ name: 'eventCount' }],
+        orderBys: [{ metric: { metricName: 'eventCount' }, desc: true }],
+        limit: 8
+      })
+    ]);
+
+    const realtimeRow = realtimeReport?.rows?.[0] || null;
+    const summaryRow = summaryReport?.rows?.[0] || null;
+    const deviceRows = Array.isArray(deviceReport?.rows) ? deviceReport.rows : [];
+    const totalDeviceUsers = deviceRows.reduce((sum, row) => sum + readMetricValue(row, 0), 0) || 1;
+
+    return {
+      configured: true,
+      available: true,
+      propertyId: GA_PROPERTY_ID,
+      eventsTracked: trackedEvents,
+      realtime: {
+        activeUsers: readMetricValue(realtimeRow, 0)
+      },
+      summary: {
+        totalUsers: readMetricValue(summaryRow, 0),
+        sessions: readMetricValue(summaryRow, 1),
+        screenPageViews: readMetricValue(summaryRow, 2)
+      },
+      trend: (trendReport?.rows || []).map((row) => ({
+        date: readDimensionValue(row, 0),
+        users: readMetricValue(row, 0),
+        sessions: readMetricValue(row, 1),
+        views: readMetricValue(row, 2)
+      })),
+      channels: (channelReport?.rows || []).map((row) => ({
+        label: readDimensionValue(row, 0) || 'Unassigned',
+        sessions: readMetricValue(row, 0),
+        users: readMetricValue(row, 1)
+      })),
+      devices: deviceRows.map((row) => {
+        const users = readMetricValue(row, 0);
+        return {
+          label: readDimensionValue(row, 0) || 'Unknown',
+          users,
+          share: users / totalDeviceUsers
+        };
+      }),
+      events: (eventReport?.rows || []).map((row) => ({
+        label: readDimensionValue(row, 0) || 'unknown_event',
+        count: readMetricValue(row, 0)
+      }))
+    };
+  } catch (error) {
+    return {
+      configured: true,
+      available: false,
+      propertyId: GA_PROPERTY_ID,
+      eventsTracked: trackedEvents,
+      error: error?.response?.data?.error?.message || error.message || 'Google Analytics request failed.'
+    };
+  }
+}
+
+async function buildDashboardOperationsSnapshot() {
+  const databaseStats = db ? await db.getStats() : [];
+  return {
+    health: {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      segments: Object.keys(segmentData).length,
+      intervals: trafficIntervals.length,
+      collecting: isCollecting
+    },
+    database: {
+      configured: Boolean(db),
+      recentDays: Array.isArray(databaseStats)
+        ? databaseStats.map((entry) => ({
+            dateKey: entry.date_key,
+            intervalCount: Number(entry.interval_count) || 0,
+            firstSnapshot: entry.first_snapshot || null,
+            lastSnapshot: entry.last_snapshot || null
+          }))
+        : []
+    },
+    counterflow: {
+      status: counterFlowData.currentStatus || 'unknown',
+      lanesOutbound: Number.isFinite(Number(counterFlowData.lanesOutbound))
+        ? Number(counterFlowData.lanesOutbound)
+        : 0,
+      lastChecked: counterFlowData.lastChecked || null,
+      lastCheckedLabel: counterFlowData.lastChecked
+        ? new Date(counterFlowData.lastChecked).toLocaleString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit'
+          })
+        : null,
+      lastError: counterFlowData.lastError || null
+    }
+  };
+}
+
+async function buildDashboardOverviewPayload() {
+  const [analytics, operations] = await Promise.all([
+    buildGoogleAnalyticsSnapshot(),
+    buildDashboardOperationsSnapshot()
+  ]);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    analytics,
+    operations
+  };
+}
+
+async function getDashboardOverviewPayload(options = {}) {
+  const forceRefresh = !!options.forceRefresh;
+  const now = Date.now();
+  if (!forceRefresh && dashboardOverviewCache.payload && (now - dashboardOverviewCache.fetchedAt) < DASHBOARD_CACHE_TTL_MS) {
+    return dashboardOverviewCache.payload;
+  }
+  if (!forceRefresh && dashboardOverviewCache.promise) {
+    return dashboardOverviewCache.promise;
+  }
+
+  dashboardOverviewCache.promise = buildDashboardOverviewPayload()
+    .then((payload) => {
+      dashboardOverviewCache.payload = payload;
+      dashboardOverviewCache.fetchedAt = Date.now();
+      return payload;
+    })
+    .finally(() => {
+      dashboardOverviewCache.promise = null;
+    });
+
+  return dashboardOverviewCache.promise;
+}
 let consecutiveTrafficCollectionFailures = 0;
 let lastTrafficCollectionFailureMessage = null;
 let lastTrafficWatchdogAlertAtMs = 0;
@@ -3343,6 +3651,21 @@ app.get('/api/database/stats', async (req, res) => {
     res.status(500).json({ 
       database: false,
       error: error.message 
+    });
+  }
+});
+
+app.get('/api/dashboard/overview', async (req, res) => {
+  try {
+    const payload = await getDashboardOverviewPayload({
+      forceRefresh: req.query.refresh === '1'
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to build dashboard overview',
+      details: error.message
     });
   }
 });
