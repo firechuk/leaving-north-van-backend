@@ -2705,34 +2705,89 @@ const normalizeIncidentSeverity = (severity) => {
 const isIncidentCurrentlyActive = (event) => {
   const now = new Date();
   const schedule = event.schedule;
-  if (!schedule || !schedule.intervals) return true; // no schedule = assume active
+  if (!schedule) return true; // no schedule = assume active
 
-  // Open511 intervals are ISO 8601 "start/end" pairs.
-  // If ALL intervals are in the future, the event hasn't started yet.
-  // If ANY interval overlaps now or is in the past, show it.
-  for (const interval of schedule.intervals) {
-    const parts = interval.split('/');
-    if (parts.length < 2) continue;
-    const start = new Date(parts[0]);
-    const end = new Date(parts[1]);
-    if (start <= now && now <= end) return true; // currently active
-    if (end < now) return true; // past interval, event is ongoing
-  }
+  // Check recurring_schedules (e.g. "daily 21:00-05:00" or "daily 07:00-17:00")
+  if (schedule.recurring_schedules && schedule.recurring_schedules.length > 0) {
+    // Pacific time offset: check if PDT (-7) or PST (-8)
+    // Use the local server time approach: DriveBC times are Pacific
+    const pacificNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Vancouver' }));
+    const dayOfWeek = pacificNow.getDay() || 7; // Convert Sunday=0 to 7 for Open511 (1=Mon..7=Sun)
+    const currentMinutes = pacificNow.getHours() * 60 + pacificNow.getMinutes();
 
-  // Also check the description for "Starting" dates in the future
-  const desc = (event.description || '').toLowerCase();
-  const startingMatch = desc.match(/starting\s+\w+\s+(\w+)\s+(\d+)/);
-  if (startingMatch) {
-    const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
-    const month = months[startingMatch[1].substring(0, 3).toLowerCase()];
-    const day = parseInt(startingMatch[2]);
-    if (month !== undefined && day) {
-      const startDate = new Date(now.getFullYear(), month, day);
-      if (startDate > now) return false; // hasn't started yet
+    let matchesAnySchedule = false;
+    for (const sched of schedule.recurring_schedules) {
+      // Check date range
+      if (sched.start_date) {
+        const start = new Date(sched.start_date + 'T00:00:00');
+        if (now < start) continue; // hasn't started yet
+      }
+      if (sched.end_date) {
+        const end = new Date(sched.end_date + 'T23:59:59');
+        if (now > end) continue; // already ended
+      }
+
+      // Check day of week (Open511: 1=Mon..7=Sun)
+      const days = sched.days || [1, 2, 3, 4, 5, 6, 7];
+      if (!days.includes(dayOfWeek)) continue;
+
+      // Check time window
+      if (sched.daily_start_time && sched.daily_end_time) {
+        const [startH, startM] = sched.daily_start_time.split(':').map(Number);
+        const [endH, endM] = sched.daily_end_time.split(':').map(Number);
+        const startMin = startH * 60 + startM;
+        const endMin = endH * 60 + endM;
+
+        if (endMin > startMin) {
+          // Normal window (e.g. 07:00-17:00)
+          if (currentMinutes >= startMin && currentMinutes <= endMin) {
+            matchesAnySchedule = true;
+            break;
+          }
+        } else {
+          // Overnight window (e.g. 21:00-05:00): active if after start OR before end
+          if (currentMinutes >= startMin || currentMinutes <= endMin) {
+            matchesAnySchedule = true;
+            break;
+          }
+        }
+      } else {
+        // No time restriction, just date/day match
+        matchesAnySchedule = true;
+        break;
+      }
     }
+    return matchesAnySchedule;
   }
 
-  return true;
+  // Check one-time intervals (ISO 8601 "start/end" pairs)
+  if (schedule.intervals) {
+    for (const interval of schedule.intervals) {
+      const parts = interval.split('/');
+      if (parts.length < 2) continue;
+      const start = new Date(parts[0]);
+      const end = new Date(parts[1]);
+      if (start <= now && now <= end) return true; // currently active
+      if (end < now) return true; // past interval, event is ongoing
+    }
+
+    // All intervals are in the future
+    // Check description for "Starting" dates
+    const desc = (event.description || '').toLowerCase();
+    const startingMatch = desc.match(/starting\s+\w+\s+(\w+)\s+(\d+)/);
+    if (startingMatch) {
+      const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+      const month = months[startingMatch[1].substring(0, 3).toLowerCase()];
+      const day = parseInt(startingMatch[2]);
+      if (month !== undefined && day) {
+        const startDate = new Date(now.getFullYear(), month, day);
+        if (startDate > now) return false;
+      }
+    }
+    return false; // all intervals in the future, not active now
+  }
+
+  return true; // no intervals or recurring = assume active
 };
 
 const normalizeIncidents = (events) => {
