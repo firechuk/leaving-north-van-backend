@@ -2702,8 +2702,41 @@ const normalizeIncidentSeverity = (severity) => {
   return 'minor';
 };
 
+const isIncidentCurrentlyActive = (event) => {
+  const now = new Date();
+  const schedule = event.schedule;
+  if (!schedule || !schedule.intervals) return true; // no schedule = assume active
+
+  // Open511 intervals are ISO 8601 "start/end" pairs.
+  // If ALL intervals are in the future, the event hasn't started yet.
+  // If ANY interval overlaps now or is in the past, show it.
+  for (const interval of schedule.intervals) {
+    const parts = interval.split('/');
+    if (parts.length < 2) continue;
+    const start = new Date(parts[0]);
+    const end = new Date(parts[1]);
+    if (start <= now && now <= end) return true; // currently active
+    if (end < now) return true; // past interval, event is ongoing
+  }
+
+  // Also check the description for "Starting" dates in the future
+  const desc = (event.description || '').toLowerCase();
+  const startingMatch = desc.match(/starting\s+\w+\s+(\w+)\s+(\d+)/);
+  if (startingMatch) {
+    const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+    const month = months[startingMatch[1].substring(0, 3).toLowerCase()];
+    const day = parseInt(startingMatch[2]);
+    if (month !== undefined && day) {
+      const startDate = new Date(now.getFullYear(), month, day);
+      if (startDate > now) return false; // hasn't started yet
+    }
+  }
+
+  return true;
+};
+
 const normalizeIncidents = (events) => {
-  return events.map(event => {
+  return events.filter(isIncidentCurrentlyActive).map(event => {
     const geo = event.geography;
     let geometry = null;
     if (geo && geo.type) {
