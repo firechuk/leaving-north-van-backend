@@ -46,6 +46,8 @@ app.use(express.json());
 const HERE_API_KEY = process.env.HERE_API_KEY || 'YOUR_HERE_API_KEY_NEEDED';
 const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
 const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
+const INCIDENTS_BBOX = '-123.25,49.27,-122.95,49.42'; // Wider bbox to catch approach incidents
+const DRIVEBC_INCIDENTS_URL = 'https://api.open511.gov.bc.ca/events';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
 const TRAFFIC_TODAY_CACHE_TTL_MS = 60 * 1000;
 const TRAFFIC_TODAY_CACHE_MAX_KEYS = (() => {
@@ -271,6 +273,15 @@ let counterFlowData = {
   history: [], // array of status changes for pattern analysis
   lastError: null,
   sourceUrl: null
+};
+
+// Live incident data from DriveBC
+let incidentData = {
+  events: [],
+  lastFetched: null,
+  lastError: null,
+  fetchCount: 0,
+  errorCount: 0
 };
 
 // Debug route overlay cache (all routes + tracked overlay)
@@ -2662,6 +2673,95 @@ const updateCounterFlowData = async () => {
   counterFlowData.sourceUrl = newData.sourceUrlUsed || counterFlowData.sourceUrl || null;
 };
 
+// ── DriveBC Incident Functions ──────────────────────────────────────────
+
+const normalizeIncidentType = (event) => {
+  const eventType = (event.event_type || '').toUpperCase();
+  const subtypes = (event.event_subtypes || []).map(s => s.toUpperCase());
+  const desc = (event.description || '').toLowerCase();
+
+  if (eventType === 'CONSTRUCTION') return 'construction';
+  if (eventType === 'WEATHER_CONDITION') return 'weather';
+
+  // Check description for specifics
+  if (desc.includes('police') || desc.includes('rcmp')) return 'police';
+  if (desc.includes('road closed') || desc.includes('closed to traffic')) return 'closure';
+  if (desc.includes('lane closure') || desc.includes('lane restriction') || desc.includes('single lane')) return 'lane_closure';
+
+  if (eventType === 'INCIDENT') return 'accident';
+  if (eventType === 'ROAD_CONDITION') return 'closure';
+  if (eventType === 'SPECIAL_EVENT') return 'other';
+
+  return 'other';
+};
+
+const normalizeIncidentSeverity = (severity) => {
+  const s = (severity || '').toUpperCase();
+  if (s === 'MAJOR') return 'major';
+  if (s === 'MODERATE') return 'moderate';
+  return 'minor';
+};
+
+const normalizeIncidents = (events) => {
+  return events.map(event => {
+    const geo = event.geography;
+    let geometry = null;
+    if (geo && geo.type) {
+      geometry = { type: geo.type, coordinates: geo.coordinates };
+    } else if (geo && typeof geo === 'string') {
+      try { geometry = JSON.parse(geo); } catch (_) { /* skip */ }
+    }
+    if (!geometry) return null;
+
+    return {
+      id: event.url || `drivebc-${Date.now()}-${Math.random()}`,
+      source: 'drivebc',
+      type: normalizeIncidentType(event),
+      severity: normalizeIncidentSeverity(event.severity),
+      headline: event.headline || '',
+      description: event.description || '',
+      geometry,
+      roads: (event.roads || []).map(r => ({
+        name: r.name || 'Unknown',
+        direction: r.direction || ''
+      })),
+      status: event.status || 'ACTIVE',
+      created: event.created || null,
+      updated: event.updated || null
+    };
+  }).filter(Boolean);
+};
+
+const fetchDriveBCIncidents = async () => {
+  const response = await axios.get(DRIVEBC_INCIDENTS_URL, {
+    params: {
+      bbox: INCIDENTS_BBOX,
+      format: 'json',
+      status: 'ACTIVE'
+    },
+    timeout: 30000,
+    headers: { 'User-Agent': 'LeavingNorthVan/1.0' }
+  });
+  return normalizeIncidents(response.data.events || []);
+};
+
+const updateIncidentData = async () => {
+  try {
+    const events = await fetchDriveBCIncidents();
+    incidentData.events = events;
+    incidentData.lastFetched = new Date().toISOString();
+    incidentData.lastError = null;
+    incidentData.fetchCount++;
+    if (events.length > 0) {
+      console.log(`📍 DriveBC incidents: ${events.length} active (${events.map(e => e.type).join(', ')})`);
+    }
+  } catch (error) {
+    incidentData.lastError = error.message;
+    incidentData.errorCount++;
+    console.warn(`⚠️ DriveBC incident fetch failed: ${error.message}`);
+  }
+};
+
 const bootstrapCounterFlowFromDatabase = async () => {
   if (!db) return;
   try {
@@ -3736,6 +3836,23 @@ app.get('/api/counterflow/history', async (req, res) => {
   }
 });
 
+// Live traffic incidents endpoint
+app.get('/api/incidents', async (req, res) => {
+  try {
+    res.json({
+      incidents: incidentData.events,
+      count: incidentData.events.length,
+      lastFetched: incidentData.lastFetched,
+      bbox: INCIDENTS_BBOX
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to get incident data',
+      details: error.message
+    });
+  }
+});
+
 // Initialize and start
 const startServer = async () => {
   console.log('🚀 Starting North Vancouver Traffic Server (HERE API)...');
@@ -3806,6 +3923,16 @@ const startServer = async () => {
       console.warn(`⚠️ Counter-flow update failed: ${error.message}`);
     });
   }, 60 * 1000);
+
+  // Fetch DriveBC incidents immediately, then every 2 minutes.
+  updateIncidentData().catch((error) => {
+    console.warn(`⚠️ Initial incident fetch failed: ${error.message}`);
+  });
+  setInterval(() => {
+    updateIncidentData().catch((error) => {
+      console.warn(`⚠️ Incident update failed: ${error.message}`);
+    });
+  }, 2 * 60 * 1000);
 };
 
 startServer().catch(console.error);
