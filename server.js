@@ -283,6 +283,7 @@ let incidentData = {
   fetchCount: 0,
   errorCount: 0
 };
+let incidentRawEvents = []; // raw DriveBC events before active-filtering
 
 // Debug route overlay cache (all routes + tracked overlay)
 let debugRouteSnapshot = {
@@ -2790,37 +2791,53 @@ const isIncidentCurrentlyActive = (event) => {
   return true; // no intervals or recurring = assume active
 };
 
-const normalizeIncidents = (events) => {
-  return events.filter(isIncidentCurrentlyActive).map(event => {
-    const geo = event.geography;
-    let geometry = null;
-    if (geo && geo.type) {
-      geometry = { type: geo.type, coordinates: geo.coordinates };
-    } else if (geo && typeof geo === 'string') {
-      try { geometry = JSON.parse(geo); } catch (_) { /* skip */ }
-    }
-    if (!geometry) return null;
+const normalizeIncidentEvent = (event) => {
+  const geo = event.geography;
+  let geometry = null;
+  if (geo && geo.type) {
+    geometry = { type: geo.type, coordinates: geo.coordinates };
+  } else if (geo && typeof geo === 'string') {
+    try { geometry = JSON.parse(geo); } catch (_) { /* skip */ }
+  }
+  if (!geometry) return null;
 
+  return {
+    id: event.url || `drivebc-${Date.now()}-${Math.random()}`,
+    source: 'drivebc',
+    type: normalizeIncidentType(event),
+    severity: normalizeIncidentSeverity(event.severity),
+    headline: event.headline || '',
+    description: event.description || '',
+    geometry,
+    roads: (event.roads || []).map(r => ({
+      name: r.name || 'Unknown',
+      direction: r.direction || ''
+    })),
+    status: event.status || 'ACTIVE',
+    created: event.created || null,
+    updated: event.updated || null
+  };
+};
+
+const normalizeIncidents = (events) => {
+  return events.filter(isIncidentCurrentlyActive)
+    .map(normalizeIncidentEvent)
+    .filter(Boolean);
+};
+
+const normalizeIncidentsAll = (events) => {
+  return events.map(event => {
+    const normalized = normalizeIncidentEvent(event);
+    if (!normalized) return null;
     return {
-      id: event.url || `drivebc-${Date.now()}-${Math.random()}`,
-      source: 'drivebc',
-      type: normalizeIncidentType(event),
-      severity: normalizeIncidentSeverity(event.severity),
-      headline: event.headline || '',
-      description: event.description || '',
-      geometry,
-      roads: (event.roads || []).map(r => ({
-        name: r.name || 'Unknown',
-        direction: r.direction || ''
-      })),
-      status: event.status || 'ACTIVE',
-      created: event.created || null,
-      updated: event.updated || null
+      ...normalized,
+      schedule: event.schedule || null,
+      isActive: isIncidentCurrentlyActive(event)
     };
   }).filter(Boolean);
 };
 
-const fetchDriveBCIncidents = async () => {
+const fetchDriveBCRawEvents = async () => {
   const response = await axios.get(DRIVEBC_INCIDENTS_URL, {
     params: {
       bbox: INCIDENTS_BBOX,
@@ -2830,12 +2847,14 @@ const fetchDriveBCIncidents = async () => {
     timeout: 30000,
     headers: { 'User-Agent': 'LeavingNorthVan/1.0' }
   });
-  return normalizeIncidents(response.data.events || []);
+  return response.data.events || [];
 };
 
 const updateIncidentData = async () => {
   try {
-    const events = await fetchDriveBCIncidents();
+    const rawEvents = await fetchDriveBCRawEvents();
+    incidentRawEvents = rawEvents;
+    const events = normalizeIncidents(rawEvents);
     incidentData.events = events;
     incidentData.lastFetched = new Date().toISOString();
     incidentData.lastError = null;
@@ -3927,9 +3946,13 @@ app.get('/api/counterflow/history', async (req, res) => {
 // Live traffic incidents endpoint
 app.get('/api/incidents', async (req, res) => {
   try {
+    const includeAll = req.query.include === 'all';
+    const events = includeAll
+      ? normalizeIncidentsAll(incidentRawEvents)
+      : incidentData.events;
     res.json({
-      incidents: incidentData.events,
-      count: incidentData.events.length,
+      incidents: events,
+      count: events.length,
       lastFetched: incidentData.lastFetched,
       bbox: INCIDENTS_BBOX
     });
