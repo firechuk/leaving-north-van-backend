@@ -2922,16 +2922,33 @@ const collectTrafficData = async () => {
       recordTrafficCollectionFailure('No live traffic data returned');
       return;
     }
-    
+
+    // Detect stale HERE cache responses: if this snapshot is nearly all free-flow
+    // but the previous one had significant congestion, HERE served a stale cache hit.
+    if (trafficIntervals.length > 0) {
+      const prevInterval = trafficIntervals[trafficIntervals.length - 1];
+      const prevRatios = Object.entries(prevInterval).filter(([k]) => k !== 'timestamp').map(([, v]) => v);
+      const currRatios = trafficData.map(d => d.ratio);
+      if (prevRatios.length > 0 && currRatios.length > 0) {
+        const prevSlowFrac = prevRatios.filter(r => r < 0.75).length / prevRatios.length;
+        const currFreeFrac = currRatios.filter(r => r >= 0.85).length / currRatios.length;
+        if (prevSlowFrac > 0.25 && currFreeFrac > 0.90) {
+          console.warn(`⚠️ Stale HERE cache response detected (prev ${(prevSlowFrac*100).toFixed(0)}% slow → curr ${(currFreeFrac*100).toFixed(0)}% free-flow); skipping.`);
+          recordTrafficCollectionFailure('Stale HERE cache response');
+          return;
+        }
+      }
+    }
+
     // Convert to interval format
     const interval = {
       timestamp: timestamp,
     };
-    
+
     trafficData.forEach((data) => {
       interval[data.segmentId] = data.ratio;
     });
-    
+
     trafficIntervals.push(interval);
     
     // Keep a bounded in-memory timeline for live fallback responses.
