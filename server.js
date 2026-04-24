@@ -2703,6 +2703,34 @@ const normalizeIncidentSeverity = (severity) => {
   return 'minor';
 };
 
+const parseIncidentIntervalDateTime = (value) => {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const hasExplicitTimeZone = /(?:[zZ]|[+\-]\d{2}:?\d{2})$/.test(trimmed);
+  if (hasExplicitTimeZone) {
+    const parsedMs = Date.parse(trimmed);
+    return Number.isFinite(parsedMs) ? new Date(parsedMs) : null;
+  }
+
+  const naiveMatch = trimmed.match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2}))?)?$/
+  );
+  if (!naiveMatch) {
+    const fallback = new Date(trimmed);
+    return Number.isNaN(fallback.getTime()) ? null : fallback;
+  }
+
+  const year = Number(naiveMatch[1]);
+  const month = Number(naiveMatch[2]) - 1;
+  const day = Number(naiveMatch[3]);
+  const hour = Number(naiveMatch[4] || '0');
+  const minute = Number(naiveMatch[5] || '0');
+  const second = Number(naiveMatch[6] || '0');
+  return new Date(Date.UTC(year, month, day, hour, minute, second));
+};
+
 const isIncidentCurrentlyActive = (event) => {
   const now = new Date();
   const schedule = event.schedule;
@@ -2763,14 +2791,33 @@ const isIncidentCurrentlyActive = (event) => {
 
   // Check one-time intervals (ISO 8601 "start/end" pairs)
   if (schedule.intervals) {
+    let foundValidInterval = false;
     for (const interval of schedule.intervals) {
-      const parts = interval.split('/');
-      if (parts.length < 2) continue;
-      const start = new Date(parts[0]);
-      const end = new Date(parts[1]);
-      if (start <= now && now <= end) return true; // currently active
-      if (end < now) return true; // past interval, event is ongoing
+      const parts = String(interval || '').split('/');
+      const start = parseIncidentIntervalDateTime(parts[0] || '');
+      const end = parseIncidentIntervalDateTime(parts[1] || '');
+      if (!start && !end) continue;
+
+      foundValidInterval = true;
+
+      if (start && end) {
+        if (start <= now && now <= end) return true; // currently active
+        if (end < now) return true; // past interval, event is ongoing
+        continue;
+      }
+
+      if (start && !end) {
+        if (start <= now) return true; // open-ended interval currently in effect
+        continue;
+      }
+
+      if (!start && end) {
+        if (now <= end) return true;
+        if (end < now) return true; // ended interval may still be posted as active
+      }
     }
+
+    if (foundValidInterval) return false;
 
     // All intervals are in the future
     // Check description for "Starting" dates
@@ -3264,12 +3311,6 @@ app.get('/api/traffic/window', async (req, res) => {
         '/api/traffic/window',
         () => db.getTrafficDataForDayWindow(centerDayRaw, radiusDays)
       );
-      if (!dbData) {
-        res.status(500).json({
-          error: 'Failed to fetch day-window traffic data'
-        });
-        return;
-      }
 
       const segmentCount = Object.keys(dbData.segments || {}).length;
       const windowFreshness = buildTrafficFreshness(dbData.intervals || []);

@@ -236,11 +236,25 @@ class TrafficDatabase {
     async initDatabase() {
         try {
             console.log('✅ Database connection established');
+            await this.ensureTrafficSnapshotsTable();
             await this.ensureSegmentMetadataTable();
             await this.ensureTrafficSnapshotsConstraints();
         } catch (error) {
             console.error('❌ Database initialization failed:', error);
         }
+    }
+
+    async ensureTrafficSnapshotsTable() {
+        await this.pool.query(`
+            CREATE TABLE IF NOT EXISTS traffic_snapshots (
+                id SERIAL PRIMARY KEY,
+                observed_at TEXT NOT NULL,
+                date_key TEXT NOT NULL,
+                interval_index INTEGER NOT NULL,
+                raw_data TEXT NOT NULL
+            );
+        `);
+        console.log('✅ traffic_snapshots table ready');
     }
 
     async ensureSegmentMetadataTable() {
@@ -785,11 +799,15 @@ class TrafficDatabase {
                 corruptedRecords: result.rows.length - intervals.length
             };
         } catch (error) {
-            console.error('❌ Failed to get day-window traffic data from database:', error);
-            return null;
+            console.error('❌ Failed to get day-window traffic data from database:', error.message, error.code || '');
+            // Return error detail so callers can surface it (not just null)
+            const dbError = new Error(error.message);
+            dbError.code = error.code;
+            dbError.isDbError = true;
+            throw dbError;
         }
     }
-    
+
     // Calculate 2-minute interval index within the service day (12am->12am, offset range 720-1439).
     calculateIntervalIndex(date) {
         return getServiceIntervalIndex(date);
