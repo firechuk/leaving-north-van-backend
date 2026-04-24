@@ -4102,6 +4102,20 @@ const startServer = async () => {
       console.warn(`⚠️ Incident update failed: ${error.message}`);
     });
   }, 2 * 60 * 1000);
+
+  // Prune traffic snapshots older than 21 days on startup (clears the backlog),
+  // then run once every 24 hours to keep disk usage bounded.
+  const TRAFFIC_RETENTION_DAYS = 21;
+  if (db) {
+    db.pruneOldTrafficData(TRAFFIC_RETENTION_DAYS).catch((error) => {
+      console.warn(`⚠️ Initial traffic prune failed: ${error.message}`);
+    });
+    setInterval(() => {
+      db.pruneOldTrafficData(TRAFFIC_RETENTION_DAYS).catch((error) => {
+        console.warn(`⚠️ Scheduled traffic prune failed: ${error.message}`);
+      });
+    }, 24 * 60 * 60 * 1000);
+  }
 };
 
 startServer().catch(console.error);

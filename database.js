@@ -1004,6 +1004,53 @@ class TrafficDatabase {
         }
     }
     
+    // Delete traffic snapshots older than maxDays and reclaim disk space.
+    // Safe to call on startup and on a daily schedule.
+    async pruneOldTrafficData(maxDays = 21) {
+        try {
+            if (this.readyPromise) {
+                await this.readyPromise;
+            }
+            const normalizedMaxDays = Math.max(7, Math.min(90, Number(maxDays) || 21));
+
+            // Compute the oldest allowed service-day boundary in UTC.
+            const now = new Date();
+            const cutoffDay = new Date(now);
+            cutoffDay.setUTCDate(cutoffDay.getUTCDate() - normalizedMaxDays);
+            // Align to midnight of the cutoff service-day start.
+            const cutoffIso = new Date(Date.UTC(
+                cutoffDay.getUTCFullYear(),
+                cutoffDay.getUTCMonth(),
+                cutoffDay.getUTCDate(),
+                SERVICE_DAY_START_HOUR, 0, 0, 0
+            )).toISOString();
+
+            console.log(`🗑️  Pruning traffic snapshots older than ${normalizedMaxDays} days (before ${cutoffIso})...`);
+            const deleteResult = await this.pool.query(
+                `DELETE FROM traffic_snapshots WHERE observed_at < $1`,
+                [cutoffIso]
+            );
+            const deleted = deleteResult.rowCount || 0;
+            console.log(`✅ Pruned ${deleted} old traffic snapshots (cutoff: ${cutoffIso})`);
+
+            // VACUUM to actually reclaim disk space (non-locking, runs async in postgres).
+            if (deleted > 0) {
+                try {
+                    await this.pool.query('VACUUM ANALYZE traffic_snapshots;');
+                    console.log('✅ VACUUM ANALYZE traffic_snapshots complete');
+                } catch (vacuumError) {
+                    // VACUUM can't run inside a transaction; log and continue.
+                    console.warn(`⚠️ VACUUM skipped: ${vacuumError.message}`);
+                }
+            }
+
+            return { success: true, deletedRows: deleted, cutoffIso };
+        } catch (error) {
+            console.error('❌ Failed to prune old traffic data:', error.message);
+            return { success: false, error: error.message };
+        }
+    }
+
     // Clear all traffic data (emergency database cleanup)
     async clearAllTrafficData() {
         try {
