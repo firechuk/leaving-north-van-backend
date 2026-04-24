@@ -1033,14 +1033,16 @@ class TrafficDatabase {
             const deleted = deleteResult.rowCount || 0;
             console.log(`✅ Pruned ${deleted} old traffic snapshots (cutoff: ${cutoffIso})`);
 
-            // VACUUM to actually reclaim disk space (non-locking, runs async in postgres).
+            // VACUUM FULL rewrites the table and returns disk space to the OS.
+            // Regular VACUUM only marks space as reusable within postgres — it does
+            // NOT shrink the actual file on disk. VACUUM FULL takes an exclusive lock
+            // but is brief since the table is now much smaller after the DELETE.
             if (deleted > 0) {
                 try {
-                    await this.pool.query('VACUUM ANALYZE traffic_snapshots;');
-                    console.log('✅ VACUUM ANALYZE traffic_snapshots complete');
+                    await this.pool.query('VACUUM FULL traffic_snapshots;');
+                    console.log('✅ VACUUM FULL traffic_snapshots complete — disk space reclaimed');
                 } catch (vacuumError) {
-                    // VACUUM can't run inside a transaction; log and continue.
-                    console.warn(`⚠️ VACUUM skipped: ${vacuumError.message}`);
+                    console.warn(`⚠️ VACUUM FULL skipped: ${vacuumError.message}`);
                 }
             }
 
