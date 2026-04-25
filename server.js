@@ -3042,6 +3042,24 @@ const collectTrafficData = async () => {
   }
 };
 
+// One-time emergency endpoint: truncates all traffic data to reclaim disk space.
+// TRUNCATE is instant and needs zero extra disk space (unlike VACUUM FULL).
+// Hit this once, then remove it in the next deploy.
+app.post('/api/admin/truncate-traffic', async (req, res) => {
+  if (!db) {
+    return res.status(503).json({ error: 'Database not available' });
+  }
+  try {
+    await db.pool.query('TRUNCATE TABLE traffic_snapshots;');
+    await db.pool.query('TRUNCATE TABLE traffic_segment_catalog;');
+    console.log('🗑️  Emergency truncate complete — traffic_snapshots and traffic_segment_catalog cleared');
+    res.json({ success: true, message: 'Tables truncated. Disk space will be reclaimed shortly.' });
+  } catch (error) {
+    console.error('❌ Emergency truncate failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // API endpoints
 app.get('/health', (req, res) => {
   const freshness = buildTrafficFreshness(trafficIntervals);
