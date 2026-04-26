@@ -42,9 +42,10 @@ app.use(cors({
 
 app.use(express.json());
 
-// TomTom API configuration
-const TOMTOM_API_KEY = process.env.TOMTOM_API_KEY || '';
-const TOMTOM_BASE_URL = 'https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json';
+// HERE API configuration
+const HERE_API_KEY = process.env.HERE_API_KEY || 'YOUR_HERE_API_KEY_NEEDED';
+const HERE_BASE_URL = 'https://data.traffic.hereapi.com/v7/flow';
+const NORTH_VAN_BBOX = '-123.187,49.300,-123.020,49.400';
 const INCIDENTS_BBOX = '-123.25,49.27,-122.95,49.42'; // Wider bbox to catch approach incidents
 const DRIVEBC_INCIDENTS_URL = 'https://api.open511.gov.bc.ca/events';
 const DEBUG_ROUTE_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -96,19 +97,19 @@ const TRAFFIC_TODAY_RUNTIME_SAFE_MAX_SERVICE_DAYS = (() => {
     )
   );
 })();
-// 10 fixed monitoring points for TomTom flowSegmentData API
-const TOMTOM_MONITORING_POINTS = [
-  { name: 'Lions Gate Bridge',           point: '49.3150,-123.1380', type: 'bridge',   bridgeHint: 'lions-gate'  },
-  { name: 'Ironworkers Memorial Bridge', point: '49.2990,-123.0235', type: 'bridge',   bridgeHint: 'ironworkers' },
-  { name: 'Highway 1 - The Cut',         point: '49.3270,-123.0400', type: 'highway',  bridgeHint: null          },
-  { name: 'Upper Levels at Capilano',    point: '49.3285,-123.1100', type: 'highway',  bridgeHint: null          },
-  { name: 'Upper Levels Central',        point: '49.3275,-123.0850', type: 'highway',  bridgeHint: null          },
-  { name: 'Taylor Way',                  point: '49.3260,-123.1390', type: 'arterial', bridgeHint: null          },
-  { name: 'Marine Drive',                point: '49.3250,-123.0900', type: 'arterial', bridgeHint: null          },
-  { name: 'Lonsdale at Marine',          point: '49.3200,-123.0740', type: 'arterial', bridgeHint: null          },
-  { name: 'Mountain Hwy at Hwy 1',       point: '49.3300,-123.0500', type: 'arterial', bridgeHint: null          },
-  { name: 'Phibbs Exchange',             point: '49.2950,-123.0240', type: 'arterial', bridgeHint: null          },
-];
+const MANUAL_TRACKED_SOURCE_IDS = new Set([
+  'here-net-0dcfe4832adf37',
+  'here-net-b9879cd7423d5d',
+  'here-net-cbb01b6ccf8c63',
+  'here-net-e47c5902d3946c',
+  'here-net-217f7880e97341',
+  'here-net-383887eeb1c4b2',
+  'here-net-ad611c65317425',
+  'here-net-067035bd6cc5d7',
+  'here-net-3a171ea8d95b6f',
+  'here-net-1f008d0747be84',
+  'here-net-fdc3c855f1a803'
+]);
 const TRAFFIC_DB_STALE_MAX_AGE_MS = 12 * 60 * 1000;
 const TRAFFIC_STALE_THRESHOLD_MINUTES = (() => {
   const parsed = Number.parseInt(process.env.TRAFFIC_STALE_THRESHOLD_MINUTES || '12', 10);
@@ -125,13 +126,13 @@ const TRAFFIC_WATCHDOG_STALE_MS = TRAFFIC_WATCHDOG_STALE_MINUTES * 60 * 1000;
 const TRAFFIC_WATCHDOG_INTERVAL_MS = 60 * 1000;
 const TRAFFIC_COLLECTION_TIME_ZONE = 'America/Vancouver';
 const TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES = (() => {
-  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES || '5', 10);
-  if (!Number.isFinite(parsed)) return 5;
+  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES || '2', 10);
+  if (!Number.isFinite(parsed)) return 2;
   return Math.max(1, Math.min(60, parsed));
 })();
 const TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES = (() => {
-  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES || '20', 10);
-  if (!Number.isFinite(parsed)) return 20;
+  const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES || '10', 10);
+  if (!Number.isFinite(parsed)) return 10;
   return Math.max(TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES, Math.min(180, parsed));
 })();
 const TRAFFIC_COLLECTION_OFFPEAK_START_HOUR = (() => {
@@ -293,7 +294,9 @@ let debugRouteSnapshot = {
   rawSegmentCount: 0,
   filteredSegmentCount: 0,
   selectedSegmentCount: 0,
-  filterMode: 'none'
+  filterMode: 'none',
+  manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+  manualTrackedMatchedCount: 0
 };
 
 let trafficTodayCache = new Map();
@@ -913,6 +916,75 @@ const addUniqueCoordinate = (target, point) => {
   target.push([lng, lat]);
 };
 
+const extractCoordinatesFromHereSegment = (segment) => {
+  const coordinates = [];
+  const links = segment?.location?.shape?.links;
+  if (!Array.isArray(links)) return coordinates;
+
+  links.forEach((link) => {
+    const points = Array.isArray(link?.points) ? link.points : [];
+    points.forEach((point) => {
+      const lat = toFiniteNumber(point?.lat);
+      const lng = toFiniteNumber(point?.lng);
+      if (lat === null || lng === null) return;
+      addUniqueCoordinate(coordinates, [lng, lat]);
+    });
+  });
+
+  return coordinates;
+};
+
+const extractHereReference = (segment) => {
+  const refs = [];
+  const location = segment?.location || {};
+  const pushRef = (value) => {
+    if (value === undefined || value === null) return;
+    const text = String(value).trim();
+    if (!text) return;
+    refs.push(text);
+  };
+
+  pushRef(location.id);
+  pushRef(location.locationId);
+  pushRef(location.locationRef);
+
+  const links = location?.shape?.links;
+  if (Array.isArray(links)) {
+    links.forEach((link) => {
+      pushRef(link?.id);
+      pushRef(link?.linkId);
+      pushRef(link?.locationRef);
+      pushRef(link?.ref);
+    });
+  }
+
+  const uniqueRefs = [...new Set(refs)];
+  if (uniqueRefs.length === 0) return null;
+  return uniqueRefs.join('|');
+};
+
+const extractNumericTokens = (...values) => {
+  const tokens = new Set();
+  values.forEach((value) => {
+    if (value === undefined || value === null) return;
+    const text = String(value);
+    const matches = text.match(/\d+/g);
+    if (!matches) return;
+    matches.forEach((match) => tokens.add(match));
+  });
+  return [...tokens];
+};
+
+const buildStableHereSegmentId = (segment, coordinates) => {
+  const description = String(segment?.location?.description || '').trim().toLowerCase();
+  const hereReference = String(extractHereReference(segment) || '').trim().toLowerCase();
+  const roundedCoordinates = coordinates
+    .map(([lng, lat]) => `${lng.toFixed(5)},${lat.toFixed(5)}`)
+    .join(';');
+  const hashInput = `${description}|${hereReference}|${roundedCoordinates}|${coordinates.length}`;
+  const digest = crypto.createHash('sha1').update(hashInput).digest('hex').slice(0, 14);
+  return `here-net-${digest}`;
+};
 
 const inferSegmentType = (description = '') => {
   const text = String(description || '').trim().toLowerCase();
@@ -1012,6 +1084,38 @@ const inferBridgeHint = (description = '', coordinates = []) => {
   return null;
 };
 
+const buildHereSegmentRecord = (segment, index) => {
+  const coordinates = extractCoordinatesFromHereSegment(segment);
+  if (coordinates.length < 2) return null;
+
+  const currentFlow = segment?.currentFlow || {};
+  const freeFlow = segment?.freeFlow || {};
+  const currentSpeed = toFiniteNumber(currentFlow.speed);
+  const freeFlowSpeed = toFiniteNumber(currentFlow.freeFlow ?? freeFlow.speed ?? currentSpeed);
+  const jamFactor = toFiniteNumber(currentFlow.jamFactor);
+  const confidence = toFiniteNumber(currentFlow.confidence);
+  const description = String(segment?.location?.description || `Traffic Segment ${index + 1}`).trim();
+  const hereReference = extractHereReference(segment);
+  const sourceId = buildStableHereSegmentId(segment, coordinates);
+  const numericIds = extractNumericTokens(sourceId, hereReference, description);
+  const bridgeHint = inferBridgeHint(description, coordinates);
+  const type = inferSegmentType(description);
+
+  return {
+    sourceId,
+    name: description || `Traffic Segment ${index + 1}`,
+    description: description || null,
+    coordinates,
+    type,
+    bridgeHint,
+    hereReference,
+    numericIds,
+    currentSpeed,
+    freeFlowSpeed,
+    jamFactor,
+    confidence
+  };
+};
 
 const buildFallbackAllSegmentsFromTracked = (segments = {}) => {
   const fallback = {};
@@ -1029,6 +1133,8 @@ const buildFallbackAllSegmentsFromTracked = (segments = {}) => {
       coordinates,
       type: segment?.type || 'road',
       bridgeHint: segment?.bridgeHint || null,
+      hereReference: segment?.hereReference || null,
+      numericIds: extractNumericTokens(sourceId, segment?.name, segment?.hereReference),
       currentSpeed: null,
       freeFlowSpeed: null,
       jamFactor: null,
@@ -1049,13 +1155,15 @@ const updateDebugRouteSnapshotFromFetch = (fetchResult, fetchedAt = new Date().t
 
   debugRouteSnapshot = {
     fetchedAt,
-    dataSource: fetchResult?.debugMeta?.dataSource || 'tomtom-live',
+    dataSource: fetchResult?.debugMeta?.dataSource || 'here-live',
     allSegments,
     trackedSourceIds: [...new Set(trackedSourceIds)],
     rawSegmentCount: fetchResult?.debugMeta?.rawSegmentCount || Object.keys(allSegments).length,
     filteredSegmentCount: fetchResult?.debugMeta?.filteredSegmentCount || 0,
     selectedSegmentCount: fetchResult?.debugMeta?.selectedSegmentCount || 0,
-    filterMode: fetchResult?.debugMeta?.filterMode || 'none'
+    filterMode: fetchResult?.debugMeta?.filterMode || 'none',
+    manualTrackedConfiguredCount: fetchResult?.debugMeta?.manualTrackedConfiguredCount || MANUAL_TRACKED_SOURCE_IDS.size,
+    manualTrackedMatchedCount: fetchResult?.debugMeta?.manualTrackedMatchedCount || 0
   };
 };
 
@@ -1885,14 +1993,16 @@ const buildTrackedDebugSegments = () => {
       name: segment?.name || segmentId,
       description: segment?.description || segment?.name || segmentId,
       coordinates,
-      type: segment?.type || 'road'
+      type: segment?.type || 'road',
+      hereReference: segment?.hereReference || null,
+      numericIds: extractNumericTokens(segmentId, sourceId, segment?.name, segment?.hereReference)
     };
   });
   return trackedSegments;
 };
 
-// Fetch traffic data from TomTom flowSegmentData API (one call per monitoring point)
-const fetchTomTomTrafficData = async () => {
+// Fetch traffic data from HERE API using efficient bounding box approach
+const fetchHereTrafficData = async () => {
   const buildNoDataResult = (dataSourceLabel = 'no-data') => {
     return {
       trafficData: [],
@@ -1904,134 +2014,208 @@ const fetchTomTomTrafficData = async () => {
         allSegmentCount: 0,
         filteredSegmentCount: 0,
         selectedSegmentCount: 0,
-        filterMode: 'tomtom-points',
+        manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+        manualTrackedMatchedCount: 0,
+        filterMode: 'none',
         trackedSourceIds: []
       }
     };
   };
 
-  if (!TOMTOM_API_KEY) {
-    console.log('⚠️ TomTom API key not configured; no live traffic data available.');
-    return buildNoDataResult('no-data-no-tomtom-key');
+  if (!HERE_API_KEY || HERE_API_KEY === 'YOUR_HERE_API_KEY_NEEDED') {
+    console.log('⚠️ HERE API key not configured; no live traffic data available.');
+    return buildNoDataResult('no-data-no-here-key');
   }
+  
+  try {
+    console.log('Fetching traffic data from HERE API (filtered for Tier 1+2 roads only)...');
+    
+    const response = await axios.get(HERE_BASE_URL, {
+      params: {
+        'in': `bbox:${NORTH_VAN_BBOX}`,
+        'locationReferencing': 'shape',
+        'apikey': HERE_API_KEY
+      },
+      timeout: 10000
+    });
+    
+    const rawSegments = Array.isArray(response?.data?.results) ? response.data.results : [];
+    console.log(`✅ HERE API returned ${rawSegments.length} traffic segments`);
+    
+    if (rawSegments.length === 0) {
+      console.log('⚠️ HERE API returned no traffic segments; no live traffic data available.');
+      return buildNoDataResult('no-data-empty-here-response');
+    }
 
-  const trafficData = [];
-  const segmentMetadata = {};
-  const allSegmentMetadata = {};
+    // Build "all segments" payload for debug overlay (pink layer).
+    const allSegmentMetadata = {};
+    const segmentRecords = new Map();
+    rawSegments.forEach((segment, index) => {
+      const record = buildHereSegmentRecord(segment, index);
+      if (!record) return;
+      segmentRecords.set(segment, record);
 
-  for (let pointIndex = 0; pointIndex < TOMTOM_MONITORING_POINTS.length; pointIndex++) {
-    const entry = TOMTOM_MONITORING_POINTS[pointIndex];
-    try {
-      const response = await axios.get(TOMTOM_BASE_URL, {
-        params: {
-          point: entry.point,
-          key: TOMTOM_API_KEY,
-          unit: 'KMPH'
-        },
-        timeout: 10000
-      });
-
-      const fsd = response?.data?.flowSegmentData;
-      if (!fsd) {
-        console.warn(`⚠️ TomTom returned no flowSegmentData for ${entry.name}`);
-        continue;
-      }
-
-      const currentSpeed = toFiniteNumber(fsd.currentSpeed) ?? 50;
-      const freeFlowSpeed = toFiniteNumber(fsd.freeFlowSpeed) ?? currentSpeed;
-      const confidence = toFiniteNumber(fsd.confidence) ?? 1.0;
-      const ratio = Math.max(0.1, Math.min(1.0, freeFlowSpeed > 0 ? currentSpeed / freeFlowSpeed : 1.0));
-
-      // Extract coordinates from TomTom response ([{latitude, longitude}, ...])
-      const rawCoords = fsd?.coordinates?.coordinate;
-      const allCoords = [];
-      if (Array.isArray(rawCoords)) {
-        rawCoords.forEach((c) => {
-          const lat = toFiniteNumber(c?.latitude);
-          const lng = toFiniteNumber(c?.longitude);
-          if (lat !== null && lng !== null) addUniqueCoordinate(allCoords, [lng, lat]);
+      allSegmentMetadata[record.sourceId] = {
+        id: record.sourceId,
+        name: record.name,
+        description: record.description,
+        coordinates: record.coordinates,
+        type: record.type,
+        hereReference: record.hereReference,
+        numericIds: record.numericIds,
+        currentSpeed: record.currentSpeed,
+        freeFlowSpeed: record.freeFlowSpeed,
+        jamFactor: record.jamFactor,
+        confidence: record.confidence
+      };
+    });
+    
+    // OPTIMIZATION: Filter segments to only Tier 1+2 roads before processing
+    // Helper function to check if coordinates intersect with any of our critical roads
+    const isSegmentInCriticalRoads = (segment) => {
+      const segmentCoords = extractCoordinatesFromHereSegment(segment);
+      if (segmentCoords.length === 0) return false;
+      
+      // Check if any coordinate falls within any of our critical road bounding boxes
+      return NORTH_VAN_ROADS.some(road => {
+        const [minLat, minLng, maxLat, maxLng] = road.bbox.split(',').map(Number);
+        return segmentCoords.some(([lng, lat]) => {
+          return lng >= minLng && lng <= maxLng && lat >= minLat && lat <= maxLat;
         });
-      }
+      });
+    };
+    
+    const isSegmentManuallyTracked = (segment) => {
+      const record = segmentRecords.get(segment);
+      if (!record || typeof record.sourceId !== 'string') return false;
+      return MANUAL_TRACKED_SOURCE_IDS.has(record.sourceId);
+    };
 
-      // Split coordinates into subsegments of up to 8 points each for map rendering
-      const COORDS_PER_SUBSEGMENT = 8;
-      const subsegmentCount = allCoords.length < 2
-        ? 0
-        : Math.ceil(allCoords.length / COORDS_PER_SUBSEGMENT);
+    // Track segments from critical road filters plus explicit manual picks.
+    const criticalSegments = rawSegments.filter(isSegmentInCriticalRoads);
+    const manuallyTrackedSegments = rawSegments.filter(isSegmentManuallyTracked);
+    const filteredSegmentSet = new Set(criticalSegments);
+    manuallyTrackedSegments.forEach((segment) => filteredSegmentSet.add(segment));
+    const filteredSegments = [...filteredSegmentSet];
 
-      if (subsegmentCount === 0) {
-        // No usable coords — still record a single virtual segment for data purposes
-        const segmentId = `tomtom-${pointIndex}-0`;
-        trafficData.push({ segmentId, ratio, speed: currentSpeed, freeFlowSpeed, confidence });
-        const meta = {
+    let selectedSegments = filteredSegments;
+    let filterMode = manuallyTrackedSegments.length > 0
+      ? 'critical-plus-manual'
+      : 'critical-only';
+    if (filteredSegments.length < MIN_FILTERED_SEGMENTS_FOR_TRACKED) {
+      filterMode = 'raw-fallback';
+      selectedSegments = rawSegments;
+      console.warn(
+        `⚠️ Filtered segment count too low (${filteredSegments.length}). Falling back to all ${rawSegments.length} HERE segments.`
+      );
+    }
+    if (manuallyTrackedSegments.length > 0) {
+      console.log(`🧭 Manual tracked source IDs matched: ${manuallyTrackedSegments.length}/${MANUAL_TRACKED_SOURCE_IDS.size}`);
+    }
+    console.log(`🎯 Filtered ${rawSegments.length} segments to ${filteredSegments.length} tracked candidates (serving ${selectedSegments.length}, mode=${filterMode})`);
+    
+    // DEBUG: Log a few kept/rejected segments for troubleshooting.
+    const kept = selectedSegments;
+    const rejected = filterMode === 'raw-fallback'
+      ? []
+      : rawSegments.filter(seg => !filteredSegmentSet.has(seg));
+    
+    console.log('🔍 DEBUG - Sample segments KEPT:');
+    kept.slice(0, 3).forEach((seg, i) => {
+      const coords = seg.location?.shape?.links?.[0]?.points?.[0];
+      console.log(`  ${i + 1}. ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)} - Road: ${seg.location?.description || 'Unknown'}`);
+    });
+    
+    console.log('🔍 DEBUG - Sample segments REJECTED:');  
+    rejected.slice(0, 3).forEach((seg, i) => {
+      const coords = seg.location?.shape?.links?.[0]?.points?.[0];
+      console.log(`  ${i + 1}. ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)} - Road: ${seg.location?.description || 'Unknown'}`);
+    });
+    
+    // DEBUG: Specifically look for major infrastructure keywords
+    const majorRoads = rawSegments.filter(seg => {
+      const desc = (seg.location?.description || '').toLowerCase();
+      return desc.includes('highway') || desc.includes('bridge') || desc.includes('trans-canada') || desc.includes('ironworkers') || desc.includes('lions gate');
+    });
+    
+    console.log(`🏗️  DEBUG - Found ${majorRoads.length} segments with major infrastructure keywords:`);
+    majorRoads.slice(0, 5).forEach((seg, i) => {
+      const coords = seg.location?.shape?.links?.[0]?.points?.[0];
+      const inTrackedSet = filterMode === 'raw-fallback'
+        ? 'KEPT'
+        : (filteredSegmentSet.has(seg) ? 'KEPT' : 'REJECTED');
+      console.log(`  ${i + 1}. ${inTrackedSet}: ${seg.location?.description} at ${coords?.lat?.toFixed?.(6)},${coords?.lng?.toFixed?.(6)}`);
+    });
+    
+    // Convert selected HERE traffic segments to tracked payload.
+    const trafficData = [];
+    const segmentMetadata = {};
+    
+    selectedSegments.forEach((segment, index) => {
+      const record = segmentRecords.get(segment) || buildHereSegmentRecord(segment, index);
+      if (!record) return;
+
+      const currentSpeed = record.currentSpeed !== null ? record.currentSpeed : 50;
+      const freeFlowSpeed = record.freeFlowSpeed !== null ? record.freeFlowSpeed : currentSpeed || 50;
+      const flowRatio = freeFlowSpeed > 0 ? Math.min(1.0, currentSpeed / freeFlowSpeed) : 1.0;
+      const segmentId = record.sourceId;
+      if (typeof segmentId !== 'string' || segmentId.length === 0) return;
+      
+      trafficData.push({
+        segmentId,
+        ratio: Math.max(0.1, flowRatio),
+        speed: currentSpeed,
+        freeFlowSpeed,
+        jamFactor: record.jamFactor ?? 0,
+        confidence: record.confidence ?? 1.0
+      });
+      
+      if (record.coordinates.length >= 2) {
+        segmentMetadata[segmentId] = {
           id: segmentId,
           segmentId,
-          name: entry.name,
-          description: entry.name,
-          coordinates: [],
-          type: entry.type,
-          bridgeHint: entry.bridgeHint,
-          sourceId: segmentId
+          name: record.name,
+          description: record.description,
+          coordinates: record.coordinates,
+          type: record.type,
+          bridgeHint: record.bridgeHint,
+          sourceId: record.sourceId,
+          hereReference: record.hereReference,
+          numericIds: record.numericIds
         };
-        segmentMetadata[segmentId] = meta;
-        allSegmentMetadata[segmentId] = meta;
-      } else {
-        for (let subIndex = 0; subIndex < subsegmentCount; subIndex++) {
-          const start = subIndex * COORDS_PER_SUBSEGMENT;
-          // Overlap by 1 point so subsegments connect visually on the map
-          const slice = allCoords.slice(start, start + COORDS_PER_SUBSEGMENT + 1);
-          if (slice.length < 2) continue;
-
-          const segmentId = `tomtom-${pointIndex}-${subIndex}`;
-          trafficData.push({ segmentId, ratio, speed: currentSpeed, freeFlowSpeed, confidence });
-          const meta = {
-            id: segmentId,
-            segmentId,
-            name: entry.name,
-            description: entry.name,
-            coordinates: slice,
-            type: entry.type,
-            bridgeHint: entry.bridgeHint,
-            sourceId: segmentId
-          };
-          segmentMetadata[segmentId] = meta;
-          allSegmentMetadata[segmentId] = meta;
-        }
       }
+    });
+    
+    const trackedSourceIds = [...new Set(
+      Object.values(segmentMetadata)
+        .map((segment) => segment?.sourceId)
+        .filter((value) => typeof value === 'string' && value.length > 0)
+    )];
 
-      console.log(`✅ Fetched ${entry.name}: ratio=${ratio.toFixed(2)}, speed=${currentSpeed}/${freeFlowSpeed} km/h`);
-    } catch (error) {
-      console.warn(`⚠️ TomTom fetch failed for ${entry.name}: ${error.response?.status || ''} ${error.message}`);
-    }
+    console.log(`✅ Processed ${trafficData.length} tracked segments (filtered from ${rawSegments.length} total, mode=${filterMode})`);
+    console.log(`📍 All-routes debug coverage: ${Object.keys(allSegmentMetadata).length} segments`);
 
-    // Small delay between calls to avoid burst rate-limit
-    if (pointIndex < TOMTOM_MONITORING_POINTS.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
+    return {
+      trafficData,
+      segmentMetadata,
+      allSegmentMetadata,
+      debugMeta: {
+        dataSource: 'here-live',
+        rawSegmentCount: rawSegments.length,
+        allSegmentCount: Object.keys(allSegmentMetadata).length,
+        filteredSegmentCount: filteredSegments.length,
+        selectedSegmentCount: selectedSegments.length,
+        manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+        manualTrackedMatchedCount: manuallyTrackedSegments.length,
+        filterMode,
+        trackedSourceIds
+      }
+    };
+    
+  } catch (error) {
+    console.log('❌ HERE API failed; no live traffic data available:', error.response?.status, error.message);
+    return buildNoDataResult('no-data-here-error');
   }
-
-  if (trafficData.length === 0) {
-    console.log('❌ TomTom returned no usable data for any monitoring point.');
-    return buildNoDataResult('no-data-tomtom-error');
-  }
-
-  const trackedSourceIds = Object.keys(segmentMetadata);
-  console.log(`✅ TomTom: processed ${trafficData.length} segments across ${TOMTOM_MONITORING_POINTS.length} monitoring points`);
-
-  return {
-    trafficData,
-    segmentMetadata,
-    allSegmentMetadata,
-    debugMeta: {
-      dataSource: 'tomtom-live',
-      rawSegmentCount: TOMTOM_MONITORING_POINTS.length,
-      allSegmentCount: Object.keys(allSegmentMetadata).length,
-      filteredSegmentCount: Object.keys(segmentMetadata).length,
-      selectedSegmentCount: trafficData.length,
-      filterMode: 'tomtom-points',
-      trackedSourceIds
-    }
-  };
 };
 
 // Lions Gate Bridge Counter-Flow Data Collection
@@ -2766,13 +2950,13 @@ const collectTrafficData = async () => {
     const timestamp = new Date().toISOString();
     console.log(`🚗 Collecting traffic data at ${timestamp}`);
     
-    const fetchResult = await fetchTomTomTrafficData();
+    const fetchResult = await fetchHereTrafficData();
     const trafficData = Array.isArray(fetchResult?.trafficData) ? fetchResult.trafficData : [];
     const segmentMetadata = fetchResult?.segmentMetadata && typeof fetchResult.segmentMetadata === 'object'
       ? fetchResult.segmentMetadata
       : {};
-
-    // Merge new TomTom segment metadata into accumulated segment data
+    
+    // Merge new HERE segment metadata into accumulated segment data
     if (segmentMetadata && Object.keys(segmentMetadata).length > 0) {
       segmentData = { ...segmentData, ...segmentMetadata };
       console.log(`📍 Merged segment data: ${Object.keys(segmentData).length} total segments (${Object.keys(segmentMetadata).length} from this cycle)`);
@@ -2784,6 +2968,23 @@ const collectTrafficData = async () => {
       console.warn('⚠️ No live traffic data returned; skipping interval capture.');
       recordTrafficCollectionFailure('No live traffic data returned');
       return;
+    }
+
+    // Detect stale HERE cache responses: if this snapshot is nearly all free-flow
+    // but the previous one had significant congestion, HERE served a stale cache hit.
+    if (trafficIntervals.length > 0) {
+      const prevInterval = trafficIntervals[trafficIntervals.length - 1];
+      const prevRatios = Object.entries(prevInterval).filter(([k]) => k !== 'timestamp').map(([, v]) => v);
+      const currRatios = trafficData.map(d => d.ratio);
+      if (prevRatios.length > 0 && currRatios.length > 0) {
+        const prevSlowFrac = prevRatios.filter(r => r < 0.75).length / prevRatios.length;
+        const currFreeFrac = currRatios.filter(r => r >= 0.85).length / currRatios.length;
+        if (prevSlowFrac > 0.25 && currFreeFrac > 0.90) {
+          console.warn(`⚠️ Stale HERE cache response detected (prev ${(prevSlowFrac*100).toFixed(0)}% slow → curr ${(currFreeFrac*100).toFixed(0)}% free-flow); skipping.`);
+          recordTrafficCollectionFailure('Stale HERE cache response');
+          return;
+        }
+      }
     }
 
     // Convert to interval format
@@ -2807,7 +3008,7 @@ const collectTrafficData = async () => {
     // Save to database if available
     if (db) {
       try {
-        // Clean segmentMetadata for database storage
+        // Clean segmentMetadata for database storage (remove complex HERE API objects)
         const cleanSegmentData = {};
         Object.keys(segmentMetadata).forEach((segmentId) => {
           const segment = segmentMetadata[segmentId];
@@ -2819,7 +3020,10 @@ const collectTrafficData = async () => {
             coordinates: segment.coordinates,
             type: segment.type,
             bridgeHint: segment.bridgeHint || null,
-            sourceId: segment.sourceId || segmentId
+            sourceId: segment.sourceId || segmentId,
+            hereReference: segment.hereReference || null,
+            numericIds: Array.isArray(segment.numericIds) ? segment.numericIds : []
+            // Skip originalData - contains large HERE payloads
           };
         });
         
@@ -2837,6 +3041,24 @@ const collectTrafficData = async () => {
     recordTrafficCollectionFailure(error.message);
   }
 };
+
+// One-time emergency endpoint: truncates all traffic data to reclaim disk space.
+// TRUNCATE is instant and needs zero extra disk space (unlike VACUUM FULL).
+// Hit this once, then remove it in the next deploy.
+app.post('/api/admin/truncate-traffic', async (req, res) => {
+  if (!db) {
+    return res.status(503).json({ error: 'Database not available' });
+  }
+  try {
+    await db.pool.query('TRUNCATE TABLE traffic_snapshots;');
+    await db.pool.query('TRUNCATE TABLE traffic_segment_catalog;');
+    console.log('🗑️  Emergency truncate complete — traffic_snapshots and traffic_segment_catalog cleared');
+    res.json({ success: true, message: 'Tables truncated. Disk space will be reclaimed shortly.' });
+  } catch (error) {
+    console.error('❌ Emergency truncate failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // API endpoints
 app.get('/health', (req, res) => {
@@ -3614,10 +3836,10 @@ app.get('/api/debug/routes', async (req, res) => {
 
     if (shouldRefresh) {
       const refreshedAt = new Date().toISOString();
-      const refreshResult = await fetchTomTomTrafficData();
+      const refreshResult = await fetchHereTrafficData();
       updateDebugRouteSnapshotFromFetch(refreshResult, refreshedAt);
 
-      // If TomTom is unavailable, still provide a usable overlay from current tracked geometry.
+      // If HERE is unavailable, still provide a usable overlay from current tracked geometry.
       if (Object.keys(debugRouteSnapshot.allSegments || {}).length === 0) {
         const fallbackAllSegments = buildFallbackAllSegmentsFromTracked(segmentData);
         debugRouteSnapshot = {
@@ -3628,7 +3850,9 @@ app.get('/api/debug/routes', async (req, res) => {
           rawSegmentCount: Object.keys(fallbackAllSegments).length,
           filteredSegmentCount: Object.keys(segmentData).length,
           selectedSegmentCount: Object.keys(segmentData).length,
-          filterMode: 'tracked-fallback'
+          filterMode: 'tracked-fallback',
+          manualTrackedConfiguredCount: MANUAL_TRACKED_SOURCE_IDS.size,
+          manualTrackedMatchedCount: 0
         };
       }
     }
@@ -3665,6 +3889,7 @@ app.get('/api/debug/routes', async (req, res) => {
       timestamp: new Date().toISOString(),
       fetchedAt: debugRouteSnapshot.fetchedAt,
       dataSource: debugRouteSnapshot.dataSource,
+      bbox: NORTH_VAN_BBOX,
       summary: {
         allSegments: Object.keys(allSegments).length,
         trackedSegments: Object.keys(trackedSegments).length,
@@ -3673,6 +3898,8 @@ app.get('/api/debug/routes', async (req, res) => {
         filteredSegmentCount: debugRouteSnapshot.filteredSegmentCount,
         selectedSegmentCount: debugRouteSnapshot.selectedSegmentCount,
         filterMode: debugRouteSnapshot.filterMode,
+        manualTrackedConfiguredCount: debugRouteSnapshot.manualTrackedConfiguredCount,
+        manualTrackedMatchedCount: debugRouteSnapshot.manualTrackedMatchedCount,
         cacheAgeMs
       },
       allSegments,
@@ -3815,7 +4042,7 @@ app.get('/api/incidents', async (req, res) => {
 
 // Initialize and start
 const startServer = async () => {
-  console.log('🚀 Starting North Vancouver Traffic Server (TomTom API)...');
+  console.log('🚀 Starting North Vancouver Traffic Server (HERE API)...');
   console.log(
     `⏱️ Traffic cadence config: peak=${TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES}m, ` +
     `off-peak=${TRAFFIC_COLLECTION_OFFPEAK_INTERVAL_MINUTES}m, ` +
@@ -3825,8 +4052,8 @@ const startServer = async () => {
 
   const httpServer = app.listen(PORT, () => {
     console.log(`🌐 Server running on port ${PORT}`);
-    console.log(`📍 Monitoring ${TOMTOM_MONITORING_POINTS.length} TomTom points`);
-    console.log(`🔑 TomTom API: ${TOMTOM_API_KEY ? 'Configured' : 'Not configured — set TOMTOM_API_KEY'}`);
+    console.log(`📍 Monitoring ${NORTH_VAN_ROADS.length} major roads with ${Object.keys(segmentData).length} segments`);
+    console.log(`🔑 HERE API: ${HERE_API_KEY !== 'YOUR_HERE_API_KEY_NEEDED' ? 'Configured' : 'Not configured'}`);
     console.log(
       `🛡️ Read guard: concurrency=${TRAFFIC_HEAVY_READ_MAX_CONCURRENCY}, ` +
       `waitTimeoutMs=${TRAFFIC_HEAVY_READ_WAIT_TIMEOUT_MS}, heapSoft=${TRAFFIC_HEAP_SOFT_LIMIT_MB}MB, ` +
