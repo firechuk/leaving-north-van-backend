@@ -1,3 +1,4 @@
+// Startup: pruneOldTrafficData() runs on init — ensures restored backups are trimmed to 21 days.
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
