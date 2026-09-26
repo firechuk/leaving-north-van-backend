@@ -19,15 +19,37 @@ const GOOGLE_TOKEN_AUDIENCE = 'https://oauth2.googleapis.com/token';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GA_REPORTING_BASE_URL = 'https://analyticsdata.googleapis.com/v1beta';
 const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
+
+// Selectable dashboard windows. 'all' starts well before the property existed —
+// GA clamps to the property's creation date, so this needs no maintenance and
+// cannot drift out of date.
+const DASHBOARD_RANGES = {
+  '7d':  { startDate: '7daysAgo',   label: 'Last 7 days' },
+  '30d': { startDate: '29daysAgo',  label: 'Last 30 days' },
+  '90d': { startDate: '89daysAgo',  label: 'Last 90 days' },
+  'all': { startDate: '2020-01-01', label: 'All time' }
+};
+const DEFAULT_DASHBOARD_RANGE = '7d';
+
+function normalizeDashboardRange(value) {
+  const key = String(value || '').trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(DASHBOARD_RANGES, key) ? key : DEFAULT_DASHBOARD_RANGE;
+}
 const googleAccessTokenCache = {
   accessToken: null,
   expiresAt: 0
 };
-const dashboardOverviewCache = {
-  payload: null,
-  fetchedAt: 0,
-  promise: null
-};
+// Keyed by range. A single shared slot would serve a 7-day payload to a 90-day
+// request for up to a TTL — intermittently, and only under the timing that makes
+// it hardest to notice.
+const dashboardOverviewCache = new Map();
+
+function getDashboardCacheEntry(rangeKey) {
+  if (!dashboardOverviewCache.has(rangeKey)) {
+    dashboardOverviewCache.set(rangeKey, { payload: null, fetchedAt: 0, promise: null });
+  }
+  return dashboardOverviewCache.get(rangeKey);
+}
 
 // Keep process alive while logging background async failures for Railway crash triage.
 process.on('unhandledRejection', (reason) => {
@@ -404,7 +426,40 @@ function readDimensionValue(row, index = 0) {
   return String(row?.dimensionValues?.[index]?.value || '').trim();
 }
 
-async function buildGoogleAnalyticsSnapshot() {
+// Long ranges are bucketed weekly rather than queried differently: GA is asked for
+// daily rows either way, so the API cost is identical and a range switch cannot
+// change what the numbers mean. 'All time' would otherwise plot several hundred
+// points into a chart a few hundred pixels wide.
+const TREND_DAILY_MAX_POINTS = 120;
+
+function bucketTrend(rows) {
+  if (rows.length <= TREND_DAILY_MAX_POINTS) return rows;
+  const buckets = new Map();
+  rows.forEach((row) => {
+    // YYYYMMDD -> the Monday of its ISO week, as the bucket's label.
+    // Anchored at T12:00:00Z and stepped with setUTCDate — the only form of this
+    // the project trusts. A local-date build here is the bug that has landed four
+    // separate times; see the gotchas in automation/nightly-reel/CLAUDE.md.
+    const d = new Date(Date.UTC(
+      Number(row.date.slice(0, 4)), Number(row.date.slice(4, 6)) - 1, Number(row.date.slice(6, 8)), 12
+    ));
+    if (Number.isNaN(d.getTime())) return;
+    const dow = (d.getUTCDay() + 6) % 7;         // Monday = 0
+    d.setUTCDate(d.getUTCDate() - dow);
+    const key = d.toISOString().slice(0, 10).replace(/-/g, '');
+    const bucket = buckets.get(key) || { date: key, users: 0, sessions: 0, views: 0 };
+    // Users are summed, not de-duplicated: GA cannot tell us the unique count for
+    // a week we did not ask it for. Treat the weekly user figure as a visit
+    // proxy, which is why the chart labels it as a bucketed series.
+    bucket.users += row.users;
+    bucket.sessions += row.sessions;
+    bucket.views += row.views;
+    buckets.set(key, bucket);
+  });
+  return Array.from(buckets.values()).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+async function buildGoogleAnalyticsSnapshot(rangeKey = DEFAULT_DASHBOARD_RANGE) {
   // These are OUR events, and the list is now load-bearing: it filters the GA
   // events report below. Before that filter existed the report asked for the top 8
   // events by count and got half of GA's own automatic ones — page_view, scroll,
@@ -412,6 +467,8 @@ async function buildGoogleAnalyticsSnapshot() {
   // day_load_result and share_click off the end. Those three were listed as
   // "tracked" on the dashboard while their numbers were never once shown.
   // Anything added here must also be emitted by the frontend's trackAnalyticsEvent.
+  const range = DASHBOARD_RANGES[normalizeDashboardRange(rangeKey)];
+  const window = { startDate: range.startDate, endDate: 'today' };
   const trackedEvents = ['view_change', 'day_select', 'day_load_result', 'play_toggle', 'scrub_use', 'share_click', 'reel_click'];
   if (!isGoogleAnalyticsConfigured()) {
     return {
@@ -429,21 +486,26 @@ async function buildGoogleAnalyticsSnapshot() {
       trendReport,
       channelReport,
       deviceReport,
-      eventReport
+      eventReport,
+      hourReport,
+      cityReport,
+      returningReport
     ] = await Promise.all([
       runGoogleAnalyticsReport('runRealtimeReport', {
         metrics: [{ name: 'activeUsers' }]
       }),
       runGoogleAnalyticsReport('runReport', {
-        dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }],
+        dateRanges: [window],
         metrics: [
           { name: 'totalUsers' },
           { name: 'sessions' },
-          { name: 'screenPageViews' }
+          { name: 'screenPageViews' },
+          { name: 'averageSessionDuration' },
+          { name: 'engagementRate' }
         ]
       }),
       runGoogleAnalyticsReport('runReport', {
-        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dateRanges: [window],
         dimensions: [{ name: 'date' }],
         metrics: [
           { name: 'totalUsers' },
@@ -453,7 +515,7 @@ async function buildGoogleAnalyticsSnapshot() {
         orderBys: [{ dimension: { dimensionName: 'date' } }]
       }),
       runGoogleAnalyticsReport('runReport', {
-        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dateRanges: [window],
         dimensions: [{ name: 'sessionPrimaryChannelGroup' }],
         metrics: [
           { name: 'sessions' },
@@ -463,14 +525,14 @@ async function buildGoogleAnalyticsSnapshot() {
         limit: 6
       }),
       runGoogleAnalyticsReport('runReport', {
-        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dateRanges: [window],
         dimensions: [{ name: 'deviceCategory' }],
         metrics: [{ name: 'activeUsers' }],
         orderBys: [{ metric: { metricName: 'activeUsers' }, desc: true }],
         limit: 5
       }),
       runGoogleAnalyticsReport('runReport', {
-        dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
+        dateRanges: [window],
         dimensions: [{ name: 'eventName' }],
         metrics: [{ name: 'eventCount' }],
         // Restrict to our own events. GA's automatic ones are available in GA's own
@@ -487,6 +549,30 @@ async function buildGoogleAnalyticsSnapshot() {
         // Headroom over trackedEvents.length so adding one does not silently
         // push the least-used event off the end — the exact bug this replaces.
         limit: 25
+      }),
+      // When people check. For a traffic site this is the most on-brand question
+      // available: does usage peak alongside the congestion, or beforehand?
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [window],
+        dimensions: [{ name: 'hour' }],
+        metrics: [{ name: 'sessions' }],
+        orderBys: [{ dimension: { dimensionName: 'hour' } }],
+        limit: 24
+      }),
+      // Where they are. The account's Instagram following is ~half North Van; the
+      // site should be more local still, and if it is not, that changes the brief.
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [window],
+        dimensions: [{ name: 'city' }],
+        metrics: [{ name: 'totalUsers' }],
+        orderBys: [{ metric: { metricName: 'totalUsers' }, desc: true }],
+        limit: 8
+      }),
+      runGoogleAnalyticsReport('runReport', {
+        dateRanges: [window],
+        dimensions: [{ name: 'newVsReturning' }],
+        metrics: [{ name: 'totalUsers' }],
+        limit: 4
       })
     ]);
 
@@ -503,16 +589,32 @@ async function buildGoogleAnalyticsSnapshot() {
       realtime: {
         activeUsers: readMetricValue(realtimeRow, 0)
       },
+      range: { key: normalizeDashboardRange(rangeKey), label: range.label, startDate: range.startDate },
       summary: {
         totalUsers: readMetricValue(summaryRow, 0),
         sessions: readMetricValue(summaryRow, 1),
-        screenPageViews: readMetricValue(summaryRow, 2)
+        screenPageViews: readMetricValue(summaryRow, 2),
+        averageSessionSeconds: readMetricValue(summaryRow, 3),
+        engagementRate: readMetricValue(summaryRow, 4)
       },
-      trend: (trendReport?.rows || []).map((row) => ({
+      trend: bucketTrend((trendReport?.rows || []).map((row) => ({
         date: readDimensionValue(row, 0),
         users: readMetricValue(row, 0),
         sessions: readMetricValue(row, 1),
         views: readMetricValue(row, 2)
+      }))),
+      trendGranularity: (trendReport?.rows || []).length > TREND_DAILY_MAX_POINTS ? 'week' : 'day',
+      hours: (hourReport?.rows || []).map((row) => ({
+        hour: Number(readDimensionValue(row, 0)),
+        sessions: readMetricValue(row, 0)
+      })).filter((row) => Number.isFinite(row.hour)),
+      cities: (cityReport?.rows || []).map((row) => ({
+        label: readDimensionValue(row, 0) || 'Unknown',
+        users: readMetricValue(row, 0)
+      })),
+      audience: (returningReport?.rows || []).map((row) => ({
+        label: readDimensionValue(row, 0) || 'unknown',
+        users: readMetricValue(row, 0)
       })),
       channels: (channelReport?.rows || []).map((row) => ({
         label: readDimensionValue(row, 0) || 'Unassigned',
@@ -538,6 +640,7 @@ async function buildGoogleAnalyticsSnapshot() {
       available: false,
       propertyId: GA_PROPERTY_ID,
       eventsTracked: trackedEvents,
+      range: { key: normalizeDashboardRange(rangeKey), label: range.label, startDate: range.startDate },
       error: error?.response?.data?.error?.message || error.message || 'Google Analytics request failed.'
     };
   }
@@ -583,9 +686,9 @@ async function buildDashboardOperationsSnapshot() {
   };
 }
 
-async function buildDashboardOverviewPayload() {
+async function buildDashboardOverviewPayload(rangeKey = DEFAULT_DASHBOARD_RANGE) {
   const [analytics, operations] = await Promise.all([
-    buildGoogleAnalyticsSnapshot(),
+    buildGoogleAnalyticsSnapshot(rangeKey),
     buildDashboardOperationsSnapshot()
   ]);
 
@@ -598,25 +701,28 @@ async function buildDashboardOverviewPayload() {
 
 async function getDashboardOverviewPayload(options = {}) {
   const forceRefresh = !!options.forceRefresh;
+  const rangeKey = normalizeDashboardRange(options.range);
+  const entry = getDashboardCacheEntry(rangeKey);
   const now = Date.now();
-  if (!forceRefresh && dashboardOverviewCache.payload && (now - dashboardOverviewCache.fetchedAt) < DASHBOARD_CACHE_TTL_MS) {
-    return dashboardOverviewCache.payload;
+
+  if (!forceRefresh && entry.payload && (now - entry.fetchedAt) < DASHBOARD_CACHE_TTL_MS) {
+    return entry.payload;
   }
-  if (!forceRefresh && dashboardOverviewCache.promise) {
-    return dashboardOverviewCache.promise;
+  if (!forceRefresh && entry.promise) {
+    return entry.promise;
   }
 
-  dashboardOverviewCache.promise = buildDashboardOverviewPayload()
+  entry.promise = buildDashboardOverviewPayload(rangeKey)
     .then((payload) => {
-      dashboardOverviewCache.payload = payload;
-      dashboardOverviewCache.fetchedAt = Date.now();
+      entry.payload = payload;
+      entry.fetchedAt = Date.now();
       return payload;
     })
     .finally(() => {
-      dashboardOverviewCache.promise = null;
+      entry.promise = null;
     });
 
-  return dashboardOverviewCache.promise;
+  return entry.promise;
 }
 let consecutiveTrafficCollectionFailures = 0;
 let lastTrafficCollectionFailureMessage = null;
@@ -3961,7 +4067,10 @@ app.get('/api/database/stats', async (req, res) => {
 app.get('/api/dashboard/overview', async (req, res) => {
   try {
     const payload = await getDashboardOverviewPayload({
-      forceRefresh: req.query.refresh === '1'
+      forceRefresh: req.query.refresh === '1',
+      // Unrecognised values fall back to the default rather than erroring: a
+      // dashboard is not worth 400ing over a typo in a query string.
+      range: req.query.range
     });
     res.set('Cache-Control', 'no-store');
     res.json(payload);
