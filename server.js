@@ -405,7 +405,14 @@ function readDimensionValue(row, index = 0) {
 }
 
 async function buildGoogleAnalyticsSnapshot() {
-  const trackedEvents = ['view_change', 'day_select', 'day_load_result', 'play_toggle', 'scrub_use', 'share_click'];
+  // These are OUR events, and the list is now load-bearing: it filters the GA
+  // events report below. Before that filter existed the report asked for the top 8
+  // events by count and got half of GA's own automatic ones — page_view, scroll,
+  // session_start, first_visit, user_engagement — which crowded view_change,
+  // day_load_result and share_click off the end. Those three were listed as
+  // "tracked" on the dashboard while their numbers were never once shown.
+  // Anything added here must also be emitted by the frontend's trackAnalyticsEvent.
+  const trackedEvents = ['view_change', 'day_select', 'day_load_result', 'play_toggle', 'scrub_use', 'share_click', 'reel_click'];
   if (!isGoogleAnalyticsConfigured()) {
     return {
       configured: false,
@@ -466,8 +473,20 @@ async function buildGoogleAnalyticsSnapshot() {
         dateRanges: [{ startDate: '29daysAgo', endDate: 'today' }],
         dimensions: [{ name: 'eventName' }],
         metrics: [{ name: 'eventCount' }],
+        // Restrict to our own events. GA's automatic ones are available in GA's own
+        // UI and tell us nothing we designed for; a rare deliberate event like
+        // reel_click could never outrank page_view, so without this it would be
+        // invisible no matter how long we waited.
+        dimensionFilter: {
+          filter: {
+            fieldName: 'eventName',
+            inListFilter: { values: trackedEvents }
+          }
+        },
         orderBys: [{ metric: { metricName: 'eventCount' }, desc: true }],
-        limit: 8
+        // Headroom over trackedEvents.length so adding one does not silently
+        // push the least-used event off the end — the exact bug this replaces.
+        limit: 25
       })
     ]);
 
