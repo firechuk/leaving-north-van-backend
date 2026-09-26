@@ -604,6 +604,10 @@ async function buildGoogleAnalyticsSnapshot(rangeKey = DEFAULT_DASHBOARD_RANGE) 
         views: readMetricValue(row, 2)
       }))),
       trendGranularity: (trendReport?.rows || []).length > TREND_DAILY_MAX_POINTS ? 'week' : 'day',
+      // GA reports hours in the PROPERTY's timezone, not the viewer's. Surfaced so
+      // the chart can say which, rather than leaving a reader to infer it from the
+      // shape of the curve — which is exactly what happened when this was built.
+      hoursTimeZone: hourReport?.metadata?.timeZone || null,
       hours: (hourReport?.rows || []).map((row) => ({
         hour: Number(readDimensionValue(row, 0)),
         sessions: readMetricValue(row, 0)
