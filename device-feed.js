@@ -11,6 +11,10 @@
 //   map         {version, segments[{bridge, pts[x,y,...]}], levels[]}  pts in 466 px screen
 //               space; levels: one char per slot, 0 calm .. 3 heavy, "." no data
 //   generated_at, latest_reading (ISO), now_minute (local minute of the latest reading)
+//   bridges[].now  the latest reading, combined the way the site's bridge widgets do it
+//                  (getBridgeDisplayRatio: half the median, half the worst quarter), so
+//                  the device and the site agree at the same moment
+//   map.now        one level character per segment from the latest reading (the site's map)
 
 const TIME_ZONE = 'America/Vancouver';
 const SLOT_MINUTES = 10;
@@ -85,6 +89,25 @@ function slowFractionSeries(buckets) {
     if (perReading.length) out[slot] = round(mean(perReading), 4);
   }
   return out;
+}
+
+// The site's bridge number for one reading (app.js getBridgeDisplayRatio): clamp to
+// 0..1; two or fewer segments average; otherwise half the median, half the mean of
+// the worst quarter, so a jammed stretch isn't hidden by free-flowing approaches.
+function siteBridgeRatio(ratios) {
+  const r = ratios.filter(isRatio).map((v) => Math.max(0, Math.min(1, v)));
+  if (!r.length) return null;
+  if (r.length <= 2) return mean(r);
+  const sorted = [...r].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const worst = sorted.slice(0, Math.max(1, Math.ceil(sorted.length * 0.25)));
+  return median * 0.5 + mean(worst) * 0.5;
+}
+
+function bridgeIds(segments, bridgeId) {
+  return Object.entries(segments || {})
+    .filter(([, s]) => s && s.bridgeHint === bridgeId)
+    .map(([id]) => id);
 }
 
 function averageSeries(seriesList, places) {
@@ -178,23 +201,29 @@ function usualFor(previousDays) {
 function buildDeviceFeed({ day, weekday, intervals, segments, usual }) {
   const buckets = bucketBySlot(intervals, day);
   const geometry = mapGeometry(segments);
-  const latest = (intervals || [])
-    .map((iv) => iv && iv.timestamp)
-    .filter((t) => t && localDayAndMinute(t).day === day)
-    .sort()
-    .pop() || null;
+  const todays = (intervals || []).filter((iv) => iv && iv.timestamp &&
+    localDayAndMinute(iv.timestamp).day === day);
+  const latestIv = todays.reduce((a, iv) => (!a || iv.timestamp > a.timestamp ? iv : a), null);
+  const latest = latestIv ? latestIv.timestamp : null;
   return {
     schema: 1,
     day,
     weekday,
     slot_minutes: SLOT_MINUTES,
     first_slot_minute: FIRST_SLOT_MINUTE,
-    bridges: BRIDGES.map(([id, name]) => ({
-      id, name, today: bridgeSeries(buckets, segments, id), usual: usual.bridges[id]
-    })),
+    bridges: BRIDGES.map(([id, name]) => {
+      const now = latestIv ? siteBridgeRatio(bridgeIds(segments, id).map((sid) => latestIv[sid])) : null;
+      return { id, name, today: bridgeSeries(buckets, segments, id), usual: usual.bridges[id],
+        now: now === null ? null : round(now, 3) };
+    }),
     ring: { metric: 'slow_fraction', slow_below: SLOW_BELOW, today: slowFractionSeries(buckets), usual: usual.ring },
     usual_basis: `the last ${usual.days.length} ${weekday}s`,
-    map: { version: 1, segments: geometry.map(({ bridge, pts }) => ({ bridge, pts })), levels: mapLevels(buckets, geometry) },
+    map: {
+      version: 1,
+      segments: geometry.map(({ bridge, pts }) => ({ bridge, pts })),
+      levels: mapLevels(buckets, geometry),
+      now: latestIv ? geometry.map(({ id }) => segmentLevel(isRatio(latestIv[id]) ? latestIv[id] : null)).join('') : null
+    },
     generated_at: new Date().toISOString(),
     latest_reading: latest,
     now_minute: latest ? localDayAndMinute(latest).minute : null
@@ -216,6 +245,6 @@ function weekdayName(day) {
 }
 
 module.exports = {
-  buildDeviceFeed, usualFor, previousSameWeekdays, weekdayName, localDayAndMinute,
+  buildDeviceFeed, usualFor, previousSameWeekdays, weekdayName, localDayAndMinute, siteBridgeRatio,
   SLOT_MINUTES, SLOT_COUNT
 };
