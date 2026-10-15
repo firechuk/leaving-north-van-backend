@@ -4097,6 +4097,23 @@ const DEVICE_FEED_TTL_MS = 2 * 60 * 1000;
 let deviceFeedCache = { expiresAt: 0, body: null };
 let deviceUsualCache = { day: null, usual: null };
 
+// One local (Vancouver) day of readings from the database. getTrafficDataForDayWindow(D)
+// returns the readings of local day D-1 (checked 2026-10-15 against /api/traffic/window:
+// centerDay=2026-10-08 → 648 readings, all on Oct 7 local), so ask for D+1 and keep only
+// D; if that ever comes back empty, try D itself. Filtering by local day makes this
+// correct whichever way the helper behaves.
+async function readDeviceLocalDay(day, label) {
+  const [y, m, d] = day.split('-').map(Number);
+  const next = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+  for (const key of [next, day]) {
+    const w = await runTrafficHeavyRead(label, () => db.getTrafficDataForDayWindow(key, 0));
+    const intervals = (w.intervals || []).filter((iv) => iv && iv.timestamp &&
+      deviceFeed.localDayAndMinute(iv.timestamp).day === day);
+    if (intervals.length) return { intervals, segments: w.segments || {} };
+  }
+  return { intervals: [], segments: {} };
+}
+
 app.get('/api/device/v1', async (req, res) => {
   try {
     if (deviceFeedCache.body && Date.now() < deviceFeedCache.expiresAt) {
@@ -4109,12 +4126,12 @@ app.get('/api/device/v1', async (req, res) => {
     const day = deviceFeed.localDayAndMinute(Date.now()).day;
     let intervals = Array.isArray(trafficIntervals) ? trafficIntervals : [];
     let segments = segmentData && typeof segmentData === 'object' ? segmentData : {};
-    const hasToday = intervals.some((iv) => iv && iv.timestamp &&
-      deviceFeed.localDayAndMinute(iv.timestamp).day === day);
-    if (db && (!hasToday || Object.keys(segments).length === 0)) {
-      const dbData = await runTrafficHeavyRead('/api/device/v1', () => db.getTrafficDataForDayWindow(day, 0));
-      intervals = mergeIntervalsByTimestamp(dbData.intervals || [], intervals);
-      segments = { ...(dbData.segments || {}), ...segments };
+    // Memory only holds what's arrived since the last restart, so today always comes from
+    // the database too (one read per 2-minute cache), with memory's newest on top
+    if (db) {
+      const dbData = await readDeviceLocalDay(day, '/api/device/v1');
+      intervals = mergeIntervalsByTimestamp(dbData.intervals, intervals);
+      segments = { ...dbData.segments, ...segments };
     }
 
     if (deviceUsualCache.day !== day) {
@@ -4122,8 +4139,8 @@ app.get('/api/device/v1', async (req, res) => {
       for (const d of deviceFeed.previousSameWeekdays(day)) {
         if (!db) break;
         try {
-          const w = await runTrafficHeavyRead('/api/device/v1 usual', () => db.getTrafficDataForDayWindow(d, 0));
-          previous.push({ day: d, intervals: w.intervals || [], segments: w.segments || {} });
+          const w = await readDeviceLocalDay(d, '/api/device/v1 usual');
+          previous.push({ day: d, intervals: w.intervals, segments: w.segments });
         } catch (err) {
           console.warn(`⚠️ /api/device/v1: no usual-day data for ${d} (${err.code || err.message})`);
         }
