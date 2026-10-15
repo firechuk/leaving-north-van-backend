@@ -6,6 +6,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 // const cheerio = require('cheerio'); // Removed for Node compatibility
 const TrafficDatabase = require('./database');
+const deviceFeed = require('./device-feed');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -4087,6 +4088,68 @@ app.get('/api/dashboard/overview', async (req, res) => {
 });
 
 // Counterflow-specific endpoint
+// The desk device's feed: everything its screen draws in one small JSON (device-feed.js).
+// Built from data already held: today's readings from memory (the database only when
+// memory has none, as /api/traffic/focus does); the usual same weekday from the
+// database once per day, then kept in memory. The response is cached for 2 minutes, so
+// any number of devices costs one build per 2 minutes.
+const DEVICE_FEED_TTL_MS = 2 * 60 * 1000;
+let deviceFeedCache = { expiresAt: 0, body: null };
+let deviceUsualCache = { day: null, usual: null };
+
+app.get('/api/device/v1', async (req, res) => {
+  try {
+    if (deviceFeedCache.body && Date.now() < deviceFeedCache.expiresAt) {
+      res.set('X-Device-Cache', 'HIT');
+      res.set('Cache-Control', 'public, max-age=60');
+      res.type('application/json').send(deviceFeedCache.body);
+      return;
+    }
+
+    const day = deviceFeed.localDayAndMinute(Date.now()).day;
+    let intervals = Array.isArray(trafficIntervals) ? trafficIntervals : [];
+    let segments = segmentData && typeof segmentData === 'object' ? segmentData : {};
+    const hasToday = intervals.some((iv) => iv && iv.timestamp &&
+      deviceFeed.localDayAndMinute(iv.timestamp).day === day);
+    if (db && (!hasToday || Object.keys(segments).length === 0)) {
+      const dbData = await runTrafficHeavyRead('/api/device/v1', () => db.getTrafficDataForDayWindow(day, 0));
+      intervals = mergeIntervalsByTimestamp(dbData.intervals || [], intervals);
+      segments = { ...(dbData.segments || {}), ...segments };
+    }
+
+    if (deviceUsualCache.day !== day) {
+      const previous = [];
+      for (const d of deviceFeed.previousSameWeekdays(day)) {
+        if (!db) break;
+        try {
+          const w = await runTrafficHeavyRead('/api/device/v1 usual', () => db.getTrafficDataForDayWindow(d, 0));
+          previous.push({ day: d, intervals: w.intervals || [], segments: w.segments || {} });
+        } catch (err) {
+          console.warn(`⚠️ /api/device/v1: no usual-day data for ${d} (${err.code || err.message})`);
+        }
+      }
+      deviceUsualCache = { day, usual: deviceFeed.usualFor(previous) };
+    }
+
+    const feed = deviceFeed.buildDeviceFeed({
+      day, weekday: deviceFeed.weekdayName(day), intervals, segments, usual: deviceUsualCache.usual
+    });
+    const body = JSON.stringify(feed);
+    deviceFeedCache = { expiresAt: Date.now() + DEVICE_FEED_TTL_MS, body };
+    res.set('X-Device-Cache', 'MISS');
+    res.set('Cache-Control', 'public, max-age=60');
+    res.type('application/json').send(body);
+  } catch (error) {
+    if (error?.code === 'MEMORY_PRESSURE_HARD_REJECT' || error?.code === 'HEAVY_READ_QUEUE_TIMEOUT') {
+      res.set('Retry-After', '30');
+      res.status(503).json({ error: 'Device feed temporarily unavailable; retry shortly.', code: error.code });
+      return;
+    }
+    console.error('❌ Error in /api/device/v1:', error);
+    res.status(500).json({ error: 'Failed to build device feed', details: error.message });
+  }
+});
+
 app.get('/api/counterflow/status', async (req, res) => {
   try {
     const now = Date.now();
