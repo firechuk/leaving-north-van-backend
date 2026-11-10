@@ -16,7 +16,10 @@
 //                  the device and the site agree at the same moment
 //   map.now        one level character per segment from the latest reading (the site's map)
 
-const TIME_ZONE = 'America/Vancouver';
+// BC is on a fixed UTC-7 'Pacific Time' since 2026-11-01 (no fall-back); Node's bundled ICU tz data predates it and still
+// falls back, which ran every local-time calculation here an hour early from Nov 1. Etc/GMT+7 is UTC-7 with no DST, which is
+// exactly Vancouver for every date this service has data for (PDT from 2026-03-08, fixed since). No tz-data dependency.
+const TIME_ZONE = 'Etc/GMT+7';
 const SLOT_MINUTES = 10;
 const FIRST_SLOT_MINUTE = 0;
 const SLOT_COUNT = (24 * 60) / SLOT_MINUTES;

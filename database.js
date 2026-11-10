@@ -1,7 +1,10 @@
 // PostgreSQL integration for traffic data persistence
 const { Pool } = require('pg');
 
-const SERVICE_TIME_ZONE = 'America/Vancouver';
+// BC is on a fixed UTC-7 'Pacific Time' since 2026-11-01 (no fall-back); Node's bundled ICU tz data predates it and still
+// falls back, which ran every local-time calculation here an hour early from Nov 1. Etc/GMT+7 is UTC-7 with no DST, which is
+// exactly Vancouver for every date this service has data for (PDT from 2026-03-08, fixed since). No tz-data dependency.
+const SERVICE_TIME_ZONE = 'Etc/GMT+7';
 const SERVICE_DAY_START_HOUR = 0;
 const SNAPSHOT_INTERVAL_MINUTES = 2;
 // Cutover guard: keep legacy 4am-keyed rows and new midnight-keyed rows from colliding.

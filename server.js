@@ -148,7 +148,10 @@ const TRAFFIC_WATCHDOG_STALE_MINUTES = (() => {
 })();
 const TRAFFIC_WATCHDOG_STALE_MS = TRAFFIC_WATCHDOG_STALE_MINUTES * 60 * 1000;
 const TRAFFIC_WATCHDOG_INTERVAL_MS = 60 * 1000;
-const TRAFFIC_COLLECTION_TIME_ZONE = 'America/Vancouver';
+// BC is on a fixed UTC-7 'Pacific Time' since 2026-11-01 (no fall-back); Node's bundled ICU tz data predates it and still
+// falls back, which ran every local-time calculation here an hour early from Nov 1. Etc/GMT+7 is UTC-7 with no DST, which is
+// exactly Vancouver for every date this service has data for (PDT from 2026-03-08, fixed since). No tz-data dependency.
+const TRAFFIC_COLLECTION_TIME_ZONE = 'Etc/GMT+7';
 const TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES = (() => {
   const parsed = Number.parseInt(process.env.TRAFFIC_COLLECTION_PEAK_INTERVAL_MINUTES || '2', 10);
   if (!Number.isFinite(parsed)) return 2;
@@ -2871,7 +2874,7 @@ const isIncidentCurrentlyActive = (event) => {
   if (schedule.recurring_schedules && schedule.recurring_schedules.length > 0) {
     // Pacific time offset: check if PDT (-7) or PST (-8)
     // Use the local server time approach: DriveBC times are Pacific
-    const pacificNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Vancouver' }));
+    const pacificNow = new Date(now.toLocaleString('en-US', { timeZone: TRAFFIC_COLLECTION_TIME_ZONE }));
     const dayOfWeek = pacificNow.getDay() || 7; // Convert Sunday=0 to 7 for Open511 (1=Mon..7=Sun)
     const currentMinutes = pacificNow.getHours() * 60 + pacificNow.getMinutes();
 
