@@ -2297,7 +2297,10 @@ const fetchHereTrafficData = async () => {
       
       trafficData.push({
         segmentId,
-        ratio: Math.max(0.1, flowRatio),
+        // Floor lowered 0.1 -> 0.01 (2026-11-10). At 0.1 a standstill was stored as a crawl, which caps any
+        // travel time derived from the archive at 10x the clear-road time. 0.01 keeps the value non-zero
+        // (nothing downstream has to handle a 0 or divide by it) while letting a real stop read as one.
+        ratio: Math.max(0.01, flowRatio),
         speed: currentSpeed,
         freeFlowSpeed,
         jamFactor: record.jamFactor ?? 0,
